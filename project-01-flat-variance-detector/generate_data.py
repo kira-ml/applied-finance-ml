@@ -1,432 +1,235 @@
 import csv
 import random
+import sys
 from datetime import datetime, timedelta
-from typing import List, Tuple, Sequence, Union, Optional
-from dataclasses import dataclass
-import math
+from typing import List, Tuple, Dict, Any, Optional
 
-# Immutable configuration
-DEFAULT_START_DATE = "2022-01-01"
-DEFAULT_N_STOCKS = 10
-DEFAULT_DAYS = 504
-DEFAULT_PRICE_START = 100.0
-DEFAULT_VOLATILITY = 0.02
-DEFAULT_DRIFT = 0.0005
-DEFAULT_SEED = 42
-DEFAULT_MIN_FLAT_DAYS = 3
-DEFAULT_MAX_FLAT_DAYS = 10
-DEFAULT_N_FLAT_PERIODS = 5
+RANDOM_SEED: int = 42
 
-# Custom exceptions
-class GeneratorError(Exception):
-    """Base exception for generator errors."""
+class InvalidParameterError(ValueError):
     pass
 
-class InvalidParameterError(GeneratorError):
-    """Exception for invalid input parameters."""
-    def __init__(self, parameter: str, message: str, code: str):
-        self.parameter = parameter
-        self.message = message
-        self.code = code
-        super().__init__(f"[{code}] Parameter '{parameter}': {message}")
+class ConfigurationError(Exception):
+    pass
 
-class DataGenerationError(GeneratorError):
-    """Exception for data generation failures."""
-    def __init__(self, message: str, code: str):
-        self.message = message
-        self.code = code
-        super().__init__(f"[{code}] {message}")
-
-# Typed data structures
-@dataclass(frozen=True)
-class PricePoint:
-    date: str
-    ticker: str
-    close_price: float
-
-@dataclass(frozen=True)
 class FlatPeriod:
-    ticker: str
-    start_idx: int
-    end_idx: int
+    __slots__ = ('stock', 'start_idx', 'end_idx', 'start_date', 'end_date')
+    def __init__(self, stock: str, start_idx: int, end_idx: int, start_date: str, end_date: str):
+        self.stock = stock
+        self.start_idx = start_idx
+        self.end_idx = end_idx
+        self.start_date = start_date
+        self.end_date = end_date
 
-# Pure core logic
-def _validate_generation_params(
-    n_stocks: int,
-    days: int,
-    start_date: str,
-    seed: Optional[int]
-) -> None:
-    """Validate input parameters for data generation."""
-    if n_stocks <= 0:
-        raise InvalidParameterError(
-            "n_stocks",
-            f"must be positive, got {n_stocks}",
-            "INVALID_N_STOCKS"
-        )
-    if days <= 0:
-        raise InvalidParameterError(
-            "days",
-            f"must be positive, got {days}",
-            "INVALID_DAYS"
-        )
+def _validate_generation_params(n_stocks: int, days: int, start_date: str) -> None:
+    if not isinstance(n_stocks, int):
+        raise InvalidParameterError(f"n_stocks must be int, got {type(n_stocks)}")
+    if n_stocks < 1 or n_stocks > 100:
+        raise InvalidParameterError(f"n_stocks must be between 1 and 100, got {n_stocks}")
+    if not isinstance(days, int):
+        raise InvalidParameterError(f"days must be int, got {type(days)}")
+    if days < 10 or days > 2000:
+        raise InvalidParameterError(f"days must be between 10 and 2000, got {days}")
+    if not isinstance(start_date, str):
+        raise InvalidParameterError(f"start_date must be str, got {type(start_date)}")
     try:
         datetime.strptime(start_date, "%Y-%m-%d")
-    except ValueError:
-        raise InvalidParameterError(
-            "start_date",
-            f"must be YYYY-MM-DD format, got {start_date}",
-            "INVALID_DATE_FORMAT"
-        )
-    if seed is not None and seed < 0:
-        raise InvalidParameterError(
-            "seed",
-            f"must be non-negative, got {seed}",
-            "INVALID_SEED"
-        )
+    except ValueError as e:
+        raise InvalidParameterError(f"start_date must be YYYY-MM-DD format: {e}")
 
-def _validate_flat_period_params(
-    n_flat_periods: int,
-    min_flat_days: int,
-    max_flat_days: int,
-    total_days: int
-) -> None:
-    """Validate parameters for flat period injection."""
-    if n_flat_periods < 0:
-        raise InvalidParameterError(
-            "n_flat_periods",
-            f"must be non-negative, got {n_flat_periods}",
-            "INVALID_N_FLAT_PERIODS"
-        )
-    if min_flat_days <= 0:
-        raise InvalidParameterError(
-            "min_flat_days",
-            f"must be positive, got {min_flat_days}",
-            "INVALID_MIN_FLAT_DAYS"
-        )
-    if max_flat_days < min_flat_days:
-        raise InvalidParameterError(
-            "max_flat_days",
-            f"must be >= min_flat_days ({min_flat_days}), got {max_flat_days}",
-            "INVALID_MAX_FLAT_DAYS"
-        )
-    if max_flat_days > total_days:
-        raise InvalidParameterError(
-            "max_flat_days",
-            f"cannot exceed total days ({total_days}), got {max_flat_days}",
-            "MAX_FLAT_DAYS_EXCEEDS_TOTAL"
-        )
+def _validate_flat_params(n_flat_periods: int, min_flat_days: int, max_flat_days: int) -> None:
+    if not isinstance(n_flat_periods, int):
+        raise InvalidParameterError(f"n_flat_periods must be int, got {type(n_flat_periods)}")
+    if n_flat_periods < 0 or n_flat_periods > 50:
+        raise InvalidParameterError(f"n_flat_periods must be between 0 and 50, got {n_flat_periods}")
+    if not isinstance(min_flat_days, int):
+        raise InvalidParameterError(f"min_flat_days must be int, got {type(min_flat_days)}")
+    if min_flat_days < 1 or min_flat_days > 30:
+        raise InvalidParameterError(f"min_flat_days must be between 1 and 30, got {min_flat_days}")
+    if not isinstance(max_flat_days, int):
+        raise InvalidParameterError(f"max_flat_days must be int, got {type(max_flat_days)}")
+    if max_flat_days < min_flat_days or max_flat_days > 60:
+        raise InvalidParameterError(f"max_flat_days must be >= min_flat_days and <= 60, got {max_flat_days}")
 
-def _generate_price_series(
-    days: int,
-    start_price: float,
-    volatility: float,
-    drift: float,
-    rng: random.Random
-) -> Tuple[float, ...]:
-    """Generate a geometric Brownian motion price series."""
-    prices = [start_price]
-    for _ in range(1, days):
-        prev_price = prices[-1]
-        daily_return = rng.gauss(drift, volatility)
-        next_price = prev_price * math.exp(daily_return)
-        if next_price <= 0.0 or math.isnan(next_price) or math.isinf(next_price):
-            raise DataGenerationError(
-                f"numerical instability detected: price={next_price}",
-                "NUMERICAL_INSTABILITY"
-            )
-        prices.append(next_price)
-    return tuple(prices)
+def _validate_noise_params(volatility_range: Tuple[float, float]) -> None:
+    if not isinstance(volatility_range, tuple):
+        raise InvalidParameterError(f"volatility_range must be tuple, got {type(volatility_range)}")
+    if len(volatility_range) != 2:
+        raise InvalidParameterError(f"volatility_range must have 2 elements, got {len(volatility_range)}")
+    low, high = volatility_range
+    if not isinstance(low, (int, float)):
+        raise InvalidParameterError(f"volatility_range[0] must be number, got {type(low)}")
+    if not isinstance(high, (int, float)):
+        raise InvalidParameterError(f"volatility_range[1] must be number, got {type(high)}")
+    if low <= 0 or high <= 0 or low > high or high > 0.1:
+        raise InvalidParameterError(f"volatility_range values invalid: {volatility_range}")
 
-def _generate_dates(start_date: str, days: int) -> Tuple[str, ...]:
-    """Generate a sequence of dates."""
-    current = datetime.strptime(start_date, "%Y-%m-%d")
-    dates = []
+def generate_portfolio_prices(
+    n_stocks: int = 10,
+    days: int = 504,
+    start_date: str = "2022-01-01"
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    _validate_generation_params(n_stocks, days, start_date)
+    random.seed(RANDOM_SEED)
+    
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    dates: List[str] = []
+    current = start
     for _ in range(days):
         dates.append(current.strftime("%Y-%m-%d"))
         current += timedelta(days=1)
-    return tuple(dates)
-
-def _select_flat_periods(
-    ticker: str,
-    total_days: int,
-    n_periods: int,
-    min_days: int,
-    max_days: int,
-    rng: random.Random
-) -> Tuple[FlatPeriod, ...]:
-    """Select random non-overlapping flat periods for a ticker."""
-    if n_periods == 0:
-        return ()
     
-    periods = []
-    max_attempts = 1000
-    attempts = 0
+    stock_names: List[str] = [f"STOCK_{i+1:03d}" for i in range(n_stocks)]
+    base_prices: Dict[str, float] = {}
+    for stock in stock_names:
+        base_prices[stock] = random.uniform(50.0, 200.0)
     
-    while len(periods) < n_periods and attempts < max_attempts:
-        length = rng.randint(min_days, max_days)
-        max_start = total_days - length
-        if max_start < 0:
-            attempts += 1
-            continue
-            
-        start = rng.randint(0, max_start)
-        end = start + length - 1
-        
-        # Check overlap with existing periods
-        overlap = False
-        for p in periods:
-            if not (end < p.start_idx or start > p.end_idx):
-                overlap = True
-                break
-        
-        if not overlap:
-            periods.append(FlatPeriod(ticker=ticker, start_idx=start, end_idx=end))
-        attempts += 1
+    data: List[Dict[str, Any]] = []
+    for i, date in enumerate(dates):
+        row: Dict[str, Any] = {"date": date}
+        for stock in stock_names:
+            trend = 1.0 + random.uniform(-0.002, 0.002) * (i / 10.0)
+            base_prices[stock] *= trend
+            if base_prices[stock] < 10.0:
+                base_prices[stock] = 10.0
+            if base_prices[stock] > 500.0:
+                base_prices[stock] = 500.0
+            row[stock] = round(base_prices[stock], 4)
+        data.append(row)
     
-    if len(periods) < n_periods:
-        raise DataGenerationError(
-            f"could not place {n_periods} non-overlapping periods after {max_attempts} attempts",
-            "PERIOD_PLACEMENT_FAILED"
-        )
-    
-    return tuple(sorted(periods, key=lambda p: p.start_idx))
-
-def _flatten_periods(
-    prices: Sequence[float],
-    periods: Tuple[FlatPeriod, ...]
-) -> Tuple[float, ...]:
-    """Set prices to constant values during flat periods."""
-    result = list(prices)
-    for period in periods:
-        if period.start_idx >= len(prices) or period.end_idx >= len(prices):
-            raise DataGenerationError(
-                f"period indices out of bounds: [{period.start_idx}, {period.end_idx}] for length {len(prices)}",
-                "PERIOD_INDEX_OUT_OF_BOUNDS"
-            )
-        flat_price = prices[period.start_idx]
-        for i in range(period.start_idx, period.end_idx + 1):
-            result[i] = flat_price
-    return tuple(result)
-
-def generate_portfolio_prices(
-    n_stocks: int = DEFAULT_N_STOCKS,
-    days: int = DEFAULT_DAYS,
-    start_date: str = DEFAULT_START_DATE,
-    seed: Optional[int] = DEFAULT_SEED
-) -> Tuple[PricePoint, ...]:
-    """
-    Generate synthetic portfolio price data.
-    
-    Args:
-        n_stocks: Number of stocks in portfolio
-        days: Number of trading days
-        start_date: Start date in YYYY-MM-DD format
-        seed: Random seed for reproducibility
-    
-    Returns:
-        Tuple of PricePoint objects
-    
-    Raises:
-        InvalidParameterError: If parameters are invalid
-        DataGenerationError: If data generation fails
-    """
-    # Validate inputs
-    _validate_generation_params(n_stocks, days, start_date, seed)
-    
-    # Initialize RNG
-    rng = random.Random(seed)
-    
-    # Generate dates
-    dates = _generate_dates(start_date, days)
-    
-    # Generate tickers
-    tickers = tuple(f"STOCK_{i+1:03d}" for i in range(n_stocks))
-    
-    # Generate prices for each stock
-    price_points = []
-    for ticker in tickers:
-        # Use deterministic but different seeds for each stock
-        stock_seed = rng.randint(0, 2**32 - 1)
-        stock_rng = random.Random(stock_seed)
-        
-        prices = _generate_price_series(
-            days=days,
-            start_price=DEFAULT_PRICE_START,
-            volatility=DEFAULT_VOLATILITY,
-            drift=DEFAULT_DRIFT,
-            rng=stock_rng
-        )
-        
-        for date_idx, date in enumerate(dates):
-            price_points.append(PricePoint(
-                date=date,
-                ticker=ticker,
-                close_price=round(prices[date_idx], 4)
-            ))
-    
-    return tuple(price_points)
+    return data, stock_names
 
 def inject_flat_periods(
-    data: Sequence[PricePoint],
-    n_flat_periods: int = DEFAULT_N_FLAT_PERIODS,
-    min_flat_days: int = DEFAULT_MIN_FLAT_DAYS,
-    max_flat_days: int = DEFAULT_MAX_FLAT_DAYS,
-    seed: Optional[int] = DEFAULT_SEED
-) -> Tuple[PricePoint, ...]:
-    """
-    Inject flat price periods into existing data.
-    
-    Args:
-        data: Original price points
-        n_flat_periods: Number of flat periods per stock
-        min_flat_days: Minimum days per flat period
-        max_flat_days: Maximum days per flat period
-        seed: Random seed for reproducibility
-    
-    Returns:
-        Tuple of PricePoint objects with flat periods
-    
-    Raises:
-        InvalidParameterError: If parameters are invalid
-        DataGenerationError: If flat period injection fails
-    """
+    data: List[Dict[str, Any]],
+    stock_names: List[str],
+    n_flat_periods: int = 5,
+    min_flat_days: int = 3,
+    max_flat_days: int = 10
+) -> Tuple[List[Dict[str, Any]], List[FlatPeriod]]:
+    _validate_flat_params(n_flat_periods, min_flat_days, max_flat_days)
+    if not isinstance(data, list):
+        raise InvalidParameterError(f"data must be list, got {type(data)}")
     if not data:
-        return data
+        raise InvalidParameterError("data cannot be empty")
+    if not isinstance(stock_names, list):
+        raise InvalidParameterError(f"stock_names must be list, got {type(stock_names)}")
     
-    # Validate inputs
-    tickers = tuple(sorted(set(p.ticker for p in data)))
-    dates_per_ticker = len(data) // len(tickers)
+    random.seed(RANDOM_SEED + 1)
+    modified_data = [row.copy() for row in data]
+    flat_periods: List[FlatPeriod] = []
+    days = len(modified_data)
     
-    _validate_flat_period_params(
-        n_flat_periods,
-        min_flat_days,
-        max_flat_days,
-        dates_per_ticker
-    )
-    
-    # Initialize RNG
-    rng = random.Random(seed)
-    
-    # Organize data by ticker
-    data_by_ticker = {}
-    for point in data:
-        if point.ticker not in data_by_ticker:
-            data_by_ticker[point.ticker] = []
-        data_by_ticker[point.ticker].append(point)
-    
-    # Validate data integrity
-    for ticker, points in data_by_ticker.items():
-        if len(points) != dates_per_ticker:
-            raise DataGenerationError(
-                f"inconsistent data for {ticker}: expected {dates_per_ticker} points, got {len(points)}",
-                "INCONSISTENT_DATA"
-            )
-        # Verify dates are in order
-        for i in range(1, len(points)):
-            if points[i].date <= points[i-1].date:
-                raise DataGenerationError(
-                    f"dates not strictly increasing for {ticker}",
-                    "INVALID_DATE_ORDER"
-                )
-    
-    # Process each ticker
-    result = []
-    for ticker, points in data_by_ticker.items():
-        ticker_rng = random.Random(rng.randint(0, 2**32 - 1))
+    for _ in range(n_flat_periods):
+        stock = random.choice(stock_names)
+        flat_length = random.randint(min_flat_days, max_flat_days)
+        max_start = days - flat_length
+        if max_start < 0:
+            continue
+        start_idx = random.randint(0, max_start)
+        end_idx = start_idx + flat_length - 1
         
-        # Select flat periods
-        periods = _select_flat_periods(
-            ticker=ticker,
-            total_days=len(points),
-            n_periods=n_flat_periods,
-            min_days=min_flat_days,
-            max_days=max_flat_days,
-            rng=ticker_rng
-        )
+        if start_idx > 0:
+            base_price = modified_data[start_idx - 1][stock]
+        else:
+            base_price = modified_data[start_idx][stock]
         
-        # Extract prices
-        prices = tuple(p.close_price for p in points)
+        for idx in range(start_idx, end_idx + 1):
+            modified_data[idx][stock] = round(base_price, 4)
         
-        # Flatten periods
-        flattened_prices = _flatten_periods(prices, periods)
-        
-        # Create new price points
-        for idx, point in enumerate(points):
-            result.append(PricePoint(
-                date=point.date,
-                ticker=point.ticker,
-                close_price=round(flattened_prices[idx], 4)
-            ))
+        flat_periods.append(FlatPeriod(
+            stock=stock,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            start_date=modified_data[start_idx]["date"],
+            end_date=modified_data[end_idx]["date"]
+        ))
     
-    return tuple(result)
+    return modified_data, flat_periods
 
-def save_to_csv(
-    data: Sequence[PricePoint],
-    filepath: str
-) -> None:
-    """
-    Save price points to CSV file.
-    
-    Args:
-        data: Sequence of PricePoint objects
-        filepath: Path to output CSV file
-    
-    Raises:
-        InvalidParameterError: If parameters are invalid
-        DataGenerationError: If file write fails
-    """
+def add_realistic_noise(
+    data: List[Dict[str, Any]],
+    stock_names: List[str],
+    volatility_range: Tuple[float, float] = (0.005, 0.03)
+) -> List[Dict[str, Any]]:
+    _validate_noise_params(volatility_range)
+    if not isinstance(data, list):
+        raise InvalidParameterError(f"data must be list, got {type(data)}")
     if not data:
-        raise InvalidParameterError(
-            "data",
-            "cannot be empty",
-            "EMPTY_DATA"
-        )
+        raise InvalidParameterError("data cannot be empty")
+    if not isinstance(stock_names, list):
+        raise InvalidParameterError(f"stock_names must be list, got {type(stock_names)}")
     
-    if not filepath:
-        raise InvalidParameterError(
-            "filepath",
-            "cannot be empty",
-            "EMPTY_FILEPATH"
-        )
+    random.seed(RANDOM_SEED + 2)
+    modified_data = [row.copy() for row in data]
+    low_vol, high_vol = volatility_range
     
-    if not filepath.endswith('.csv'):
-        raise InvalidParameterError(
-            "filepath",
-            "must end with .csv",
-            "INVALID_FILE_EXTENSION"
-        )
+    for stock in stock_names:
+        vol = random.uniform(low_vol, high_vol)
+        for i in range(1, len(modified_data)):
+            prev = modified_data[i-1][stock]
+            if not isinstance(prev, (int, float)):
+                raise InvalidParameterError(f"Price for {stock} at day {i-1} is not a number: {prev}")
+            noise = random.gauss(0.0, vol)
+            new_price = prev * (1.0 + noise)
+            if new_price < 0.1:
+                new_price = 0.1
+            if new_price > 1000.0:
+                new_price = 1000.0
+            modified_data[i][stock] = round(new_price, 4)
+    
+    return modified_data
+
+def save_ground_truth(flat_periods: List[FlatPeriod], filepath: str = "data/raw/ground_truth.csv") -> None:
+    if not isinstance(flat_periods, list):
+        raise InvalidParameterError(f"flat_periods must be list, got {type(flat_periods)}")
+    for period in flat_periods:
+        if not isinstance(period, FlatPeriod):
+            raise InvalidParameterError(f"flat_periods contains non-FlatPeriod: {type(period)}")
+    if not isinstance(filepath, str):
+        raise InvalidParameterError(f"filepath must be str, got {type(filepath)}")
     
     try:
-        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        with open(filepath, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['date', 'ticker', 'close_price'])
-            for point in data:
-                writer.writerow([point.date, point.ticker, point.close_price])
-    except IOError as e:
-        raise DataGenerationError(
-            f"failed to write to {filepath}: {str(e)}",
-            "FILE_WRITE_FAILED"
-        )
+            writer.writerow(['stock', 'start_idx', 'end_idx', 'start_date', 'end_date'])
+            for period in flat_periods:
+                writer.writerow([
+                    period.stock,
+                    period.start_idx,
+                    period.end_idx,
+                    period.start_date,
+                    period.end_date
+                ])
+    except OSError as e:
+        raise RuntimeError(f"Failed to write ground truth file {filepath}: {e}")
 
-# Entry point
+def save_to_csv(data: List[Dict[str, Any]], filepath: str = "data/raw/prices.csv") -> None:
+    if not isinstance(data, list):
+        raise InvalidParameterError(f"data must be list, got {type(data)}")
+    if not data:
+        raise InvalidParameterError("data cannot be empty")
+    if not isinstance(filepath, str):
+        raise InvalidParameterError(f"filepath must be str, got {type(filepath)}")
+    
+    try:
+        with open(filepath, 'w', newline='') as f:
+            if data:
+                writer = csv.DictWriter(f, fieldnames=data[0].keys())
+                writer.writeheader()
+                writer.writerows(data)
+    except OSError as e:
+        raise RuntimeError(f"Failed to write CSV file {filepath}: {e}")
+
+def main() -> None:
+    data, stock_names = generate_portfolio_prices(n_stocks=10, days=504, start_date="2022-01-01")
+    data_with_flats, flat_periods = inject_flat_periods(data, stock_names, n_flat_periods=5, min_flat_days=3, max_flat_days=10)
+    final_data = add_realistic_noise(data_with_flats, stock_names, volatility_range=(0.005, 0.03))
+    
+    import os
+    os.makedirs("data/raw", exist_ok=True)
+    
+    save_to_csv(final_data, "data/raw/prices.csv")
+    save_ground_truth(flat_periods, "data/raw/ground_truth.csv")
+
 if __name__ == "__main__":
-    # Generate base data
-    data = generate_portfolio_prices(
-        n_stocks=10,
-        days=504,
-        start_date="2022-01-01",
-        seed=42
-    )
-    
-    # Inject flat periods
-    modified_data = inject_flat_periods(
-        data=data,
-        n_flat_periods=5,
-        min_flat_days=3,
-        max_flat_days=10,
-        seed=42
-    )
-    
-    # Save to CSV
-    save_to_csv(modified_data, "data/raw/prices.csv")
+    main()
