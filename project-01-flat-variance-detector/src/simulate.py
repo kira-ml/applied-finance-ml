@@ -208,47 +208,13 @@ def _cholesky_decomposition(matrix: List[List[float]]) -> List[List[float]]:
                 val = matrix[i][i] - s
                 if val <= 0:
                     raise DataGenerationError(f"Matrix not positive definite at index {i}")
-                L[i][j] = np.sqrt(val)
+                L[i][j] = max(val, 0) ** 0.5  # Numerical stability
             else:
+                if abs(L[j][j]) < 1e-10:
+                    raise DataGenerationError(f"Numerical instability in Cholesky at [{j},{j}]")
                 L[i][j] = (1.0 / L[j][j] * (matrix[i][j] - s))
     
     return L
-
-
-def generate_price_series(days: int, base_price: float, drift: float, 
-                         volatility: float, flat_days_ranges: List[Tuple[int, int, float]], 
-                         random_state: np.random.RandomState) -> pd.Series:
-    """Generate a price series with specified flat periods."""
-    if days <= 0:
-        raise DataGenerationError("days must be positive")
-    if base_price <= 0:
-        raise DataGenerationError("base_price must be positive")
-    if volatility < 0:
-        raise DataGenerationError("volatility cannot be negative")
-    
-    # Generate log returns
-    returns = random_state.normal(drift, volatility, days)
-    
-    # Convert to price series
-    log_prices = np.log(base_price) + np.cumsum(returns)
-    prices = np.exp(log_prices)
-    
-    # Apply flat periods
-    is_flat_mask = np.zeros(days, dtype=bool)
-    for start_idx, duration, noise_level in flat_days_ranges:
-        if start_idx < 0 or start_idx + duration > days:
-            raise DataGenerationError("Flat period exceeds series bounds")
-        
-        end_idx = start_idx + duration
-        is_flat_mask[start_idx:end_idx] = True
-        
-        # Set flat value (first price in flat period)
-        flat_value = prices[start_idx]
-        for i in range(start_idx, end_idx):
-            noise = random_state.normal(0, noise_level)
-            prices[i] = flat_value + noise
-    
-    return pd.Series(prices), is_flat_mask
 
 
 def _convert_date_to_idx(date: datetime, date_list: List[datetime]) -> int:
@@ -260,7 +226,7 @@ def _convert_date_to_idx(date: datetime, date_list: List[datetime]) -> int:
 
 
 # Public interface functions
-def generate_price_series_from_config(config: SimConfig) -> Tuple[pd.DataFrame, SimulationMetadata]:
+def generate_price_series_from_config(config: SimConfig) -> Tuple[pd.DataFrame, pd.DataFrame, SimulationMetadata]:
     """Generate multi-asset price series based on configuration."""
     # Validate config
     status, error_msg = _validate_config(config)
@@ -283,8 +249,10 @@ def generate_price_series_from_config(config: SimConfig) -> Tuple[pd.DataFrame, 
         if n_days == 0:
             raise DataGenerationError("No dates generated from range")
         
-        # Generate correlated random returns
+        # Get correlation matrix
         corr_matrix = config['correlation_matrix']
+        
+        # Generate correlated random returns using Cholesky
         L = _cholesky_decomposition(corr_matrix)
         
         # Generate independent random normals
@@ -303,14 +271,15 @@ def generate_price_series_from_config(config: SimConfig) -> Tuple[pd.DataFrame, 
         
         for asset_idx, asset in enumerate(config['assets']):
             # Extract asset params
+            ticker = asset['ticker']
             base_price = asset['base_price']
             drift = asset['drift']
             volatility = asset['volatility']
             
-            # Scale returns to match asset volatility
+            # Scale returns to match asset volatility and add drift
             scaled_returns = correlated_returns[:, asset_idx] * volatility + drift
             
-            # Generate price series
+            # Generate price series (geometric Brownian motion)
             log_prices = np.log(base_price) + np.cumsum(scaled_returns)
             prices = np.exp(log_prices)
             
@@ -329,12 +298,12 @@ def generate_price_series_from_config(config: SimConfig) -> Tuple[pd.DataFrame, 
                 noise_level = flat_period['noise_level']
                 
                 if start_idx + duration > n_days:
-                    raise DataGenerationError(f"Flat period exceeds series bounds for asset {asset['ticker']}")
+                    duration = n_days - start_idx  # Trim to available days
                 
                 end_idx = start_idx + duration
                 is_flat[start_idx:end_idx] = True
                 
-                # Apply flat values
+                # Apply flat values (constant with tiny noise)
                 flat_value = prices[start_idx]
                 for i in range(start_idx, end_idx):
                     noise = random_state.normal(0, noise_level)
@@ -343,7 +312,7 @@ def generate_price_series_from_config(config: SimConfig) -> Tuple[pd.DataFrame, 
                 # Add to ground truth
                 flat_end = dates[end_idx - 1]
                 ground_truth_list.append({
-                    'ticker': asset['ticker'],
+                    'ticker': ticker,
                     'start_date': flat_start.strftime('%Y-%m-%d'),
                     'end_date': flat_end.strftime('%Y-%m-%d')
                 })
@@ -355,28 +324,36 @@ def generate_price_series_from_config(config: SimConfig) -> Tuple[pd.DataFrame, 
         # Create DataFrames
         date_strs = [d.strftime('%Y-%m-%d') for d in dates]
         
-        # Price DataFrame
-        price_df = pd.DataFrame({
-            'date': np.repeat(date_strs, n_assets),
-            'ticker': np.tile([a['ticker'] for a in config['assets']], n_days),
-            'close_price': np.column_stack(all_prices).flatten()
-        })
+        # Price DataFrame - long format
+        price_data = []
+        for date_idx, date_str in enumerate(date_strs):
+            for asset_idx, asset in enumerate(config['assets']):
+                price_data.append({
+                    'date': date_str,
+                    'ticker': asset['ticker'],
+                    'close_price': round(float(all_prices[asset_idx][date_idx]), 4)
+                })
+        price_df = pd.DataFrame(price_data)
         
-        # Ground truth DataFrame
-        truth_df = pd.DataFrame({
-            'date': np.repeat(date_strs, n_assets),
-            'ticker': np.tile([a['ticker'] for a in config['assets']], n_days),
-            'is_truly_flat': np.column_stack(all_is_flat).flatten().astype(int)
-        })
+        # Ground truth DataFrame - long format
+        truth_data = []
+        for date_idx, date_str in enumerate(date_strs):
+            for asset_idx, asset in enumerate(config['assets']):
+                truth_data.append({
+                    'date': date_str,
+                    'ticker': asset['ticker'],
+                    'is_truly_flat': int(all_is_flat[asset_idx][date_idx])
+                })
+        truth_df = pd.DataFrame(truth_data)
         
         # Calculate statistics
-        total_flat_days = np.sum(np.column_stack(all_is_flat))
+        total_flat_days = sum(sum(flat) for flat in all_is_flat)
         total_possible_days = n_days * n_assets
         
         stats: SimulationStatistics = {
             'total_days': n_days,
             'total_assets': n_assets,
-            'flat_day_percentage': total_flat_days / total_possible_days if total_possible_days > 0 else 0.0
+            'flat_day_percentage': round(total_flat_days / total_possible_days, 4) if total_possible_days > 0 else 0.0
         }
         
         # Create metadata
@@ -449,6 +426,14 @@ def run_simulation(config_path: str) -> None:
         print(f"  Prices: {config['output']['price_file']}")
         print(f"  Ground truth: {config['output']['ground_truth_file']}")
         print(f"  Metadata: {config['output']['metadata_file']}")
+        
+        # Print summary
+        print(f"\nSummary:")
+        print(f"  Date range: {config['date_range']['start']} to {config['date_range']['end']}")
+        print(f"  Total days: {metadata['statistics']['total_days']}")
+        print(f"  Total assets: {metadata['statistics']['total_assets']}")
+        print(f"  Flat day percentage: {metadata['statistics']['flat_day_percentage']:.2%}")
+        print(f"  Flat periods: {len(metadata['flat_periods_ground_truth'])}")
         
     except SimulationError as e:
         print(f"Simulation failed: {str(e)}", file=sys.stderr)
