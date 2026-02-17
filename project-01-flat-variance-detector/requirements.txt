@@ -1,9 +1,0 @@
-# Core data processing
-pandas==2.0.3
-numpy==1.24.3
-
-# No machine learning libraries needed - this is a rule-based detector
-# No scikit-learn, no tensorflow, no pytorch
-# No visualization libraries (matplotlib/seaborn) - review happens via CSV
-# No web frameworks (flask/fastapi) - batch processing only
-# No MLOps tools (mlflow) - local JSON tracking is sufficient
