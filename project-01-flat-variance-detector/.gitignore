@@ -1,0 +1,14 @@
+# Don't track data files (they're large and change frequently)
+data/raw/prices.csv
+data/processed/
+*.csv
+
+# Don't track Python artifacts
+__pycache__/
+*.pyc
+
+# Don't track environment stuff
+.env
+.venv
+env/
+venv/
