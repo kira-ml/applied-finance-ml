@@ -5,6 +5,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Sequence, Tuple
 
+DEFAULT_OUTPUT_DIR = Path("D:/applied-finance-ml/project-01-flat-variance-detector/data/raw")
+DEFAULT_FILENAME = "synthetic_prices.csv"
 NUM_TICKERS_RANGE = (1, 1000)
 DAYS_RANGE = (1, 3650)
 FILENAME_SUFFIX = ".csv"
@@ -119,16 +121,24 @@ def _get_positive_int_arg(args: Sequence[str], idx: int, name: str) -> int:
     return value
 
 if __name__ == "__main__":
-    if len(sys.argv) != 5:
-        print("Usage: simulate.py <output_path> <num_tickers> <days> <seed>")
+    args = sys.argv[1:]
+    
+    if len(args) == 3:
+        output = str(DEFAULT_OUTPUT_DIR / DEFAULT_FILENAME)
+        tickers = _get_positive_int_arg(args, 0, "num_tickers")
+        days = _get_positive_int_arg(args, 1, "days")
+        seed = _get_positive_int_arg(args, 2, "seed")
+    elif len(args) == 4:
+        output = args[0]
+        tickers = _get_positive_int_arg(args, 1, "num_tickers")
+        days = _get_positive_int_arg(args, 2, "days")
+        seed = _get_positive_int_arg(args, 3, "seed")
+    else:
+        print(f"Usage: simulate.py [output_path] <num_tickers> <days> <seed>")
+        print(f"  Default output: {DEFAULT_OUTPUT_DIR / DEFAULT_FILENAME}")
         sys.exit(1)
 
     try:
-        output = sys.argv[1]
-        tickers = _get_positive_int_arg(sys.argv, 2, "num_tickers")
-        days = _get_positive_int_arg(sys.argv, 3, "days")
-        seed = _get_positive_int_arg(sys.argv, 4, "seed")
-
         success = simulate_prices(output, tickers, days, seed)
         if success:
             print(f"Generated {tickers} tickers over {days} days to {output}")
