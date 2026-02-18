@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyc
+*.pyo
+.python-version
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Data files (gitignored - simulator outputs)
+*.csv
+*.json
+*.parquet
+*.h5
+*.hdf5
+/data/*
+!/data/.gitkeep
+
+# Logs
+*.log
+/logs/*
+!/logs/.gitkeep
+
+# Config (keep if contains secrets)
+# config.yaml  # Uncomment if config has API keys/secrets
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Notebooks (if using)
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Optional: Keep these commented unless you want to exclude
+# models/
+# outputs/
+# results/
