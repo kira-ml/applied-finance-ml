@@ -1,3 +1,0 @@
-# Core dependencies - minimal set for flat variance detection
-pandas==2.0.3
-numpy==1.24.3

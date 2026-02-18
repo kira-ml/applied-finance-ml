@@ -1,14 +1,16 @@
-# Don't track data files (they're large and change frequently)
-data/raw/prices.csv
-data/processed/
-*.csv
+# Data Artifacts
+data/raw/*.csv
+data/processed/*.csv
+experiments/*/flags.csv
+experiments/*/metrics.txt
 
-# Don't track Python artifacts
+# Environment
 __pycache__/
 *.pyc
-
-# Don't track environment stuff
-.env
-.venv
+.venv/
 env/
-venv/
+requirements.txt
+
+# OS
+.DS_Store
+Thumbs.db
