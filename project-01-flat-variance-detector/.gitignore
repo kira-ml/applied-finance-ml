@@ -10,8 +10,10 @@ __pycache__/
 venv/
 .venv/
 
-# Data
-data/prices.csv
+# Data (Ignore all generated data, keep directory structure if needed via .gitkeep)
+data/*.csv
+data/*.json
+data/*.parquet
 
 # Runtime outputs
 logs/
@@ -24,3 +26,8 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+
+# Build artifacts
+dist/
+build/
+*.egg

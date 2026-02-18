@@ -38,8 +38,8 @@ CONFIG = Config(
     max_flat_window=10,
     min_flat_windows_per_asset=1,
     max_flat_windows_per_asset=3,
-    prices_path="prices.csv",
-    ground_truth_path="ground_truth.csv",
+    prices_path=r"D:\applied-finance-ml\project-01-flat-variance-detector\data\prices.csv",
+    ground_truth_path=r"D:\applied-finance-ml\project-01-flat-variance-detector\data\ground_truth.csv",
     serialization_version=1
 )
 
