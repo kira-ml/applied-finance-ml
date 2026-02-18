@@ -104,18 +104,14 @@ def _check_schema_columns(columns: List[str], required: Set[str]) -> None:
 def _check_nulls(series: pd.Series, column_name: str) -> None:
     """
     Checks for null/NaN values in a specific series.
-    Uses pandas native check but wraps in domain exception.
+    Uses pandas native check. sum() on boolean series is guaranteed to be int >= 0.
     """
-    # isna() handles both None and NaN
-    null_count = series.isna().sum()
+    # Direct count. No complex guards needed as pandas guarantees int return for sum().
+    null_count: int = int(series.isna().sum())
     
-    # Defensive numerical guard: ensure sum is valid integer
-    if not isinstance(null_count, (int, float)) or math.isnan(null_count):
-        raise NullValueError(f"Unable to compute null count for '{column_name}'")
-        
     if null_count > 0:
         raise NullValueError(
-            f"Column '{column_name}' contains {int(null_count)} null values"
+            f"Column '{column_name}' contains {null_count} null values"
         )
 
 def _check_numeric_constraints(series: pd.Series, column_name: str, min_val: float | None = None) -> None:
@@ -123,37 +119,39 @@ def _check_numeric_constraints(series: pd.Series, column_name: str, min_val: flo
     Validates numeric domain constraints.
     Specifically checks for negative prices if min_val=0.
     """
-    # Ensure series is numeric before comparison to avoid ambiguous truth values
+    # Ensure series is numeric before comparison
     if not pd.api.types.is_numeric_dtype(series):
-        # Attempt safe conversion strictly for validation logic
         try:
             series = pd.to_numeric(series, errors='raise')
         except (ValueError, TypeError):
             raise ValueConstraintError(f"Column '{column_name}' contains non-numeric data")
 
     if min_val is not None:
-        # Check for values strictly less than minimum
         violation_mask = series < min_val
-        violation_count = violation_mask.sum()
+        violation_count: int = int(violation_mask.sum())
         
         if violation_count > 0:
             raise ValueConstraintError(
-                f"Column '{column_name}' contains {int(violation_count)} values below {min_val}"
+                f"Column '{column_name}' contains {violation_count} values below {min_val}"
             )
     
-    # Check for Infinity/NaN explicitly as they pass standard comparisons sometimes
-    if math.isinf(series.abs().sum()):
+    # Explicit Infinity/NaN check using vectorized operations
+    if series.isin([math.inf, -math.inf]).any():
         raise ValueConstraintError(f"Column '{column_name}' contains infinite values")
     
+    # Redundant safety check for NaN specifically in numeric context
     if series.isna().any():
-        # Redundant with _check_nulls but ensures local purity if called standalone
-        raise NullValueError(f"Column '{column_name}' contains NaN values")
+        raise NullValueError(f"Column '{column_name}' contains NaN values after numeric conversion")
 
 def validate_dataframe_structure(df: pd.DataFrame, config: ValidationConfig) -> ValidationResult:
     """
     Pure function to validate DataFrame structure and content.
     Returns ValidationResult on success, raises specific ValidationError on failure.
     """
+    # Pre-check: Empty DataFrame is a structural failure for this pipeline
+    if len(df) == 0:
+        raise SchemaMismatchError("Input DataFrame is empty")
+
     # 1. Schema Check
     _check_schema_columns(list(df.columns), config.required_columns)
     
@@ -191,25 +189,19 @@ def load_and_validate(file_path: str) -> pd.DataFrame:
     if not file_path:
         raise TypeEnforcementError("Parameter 'file_path' cannot be empty string")
 
-    # Resource Lifetime Management via 'with' not applicable to pd.read_csv directly 
-    # without file handle, but we ensure explicit loading.
     try:
-        # Deterministic loading: explicit dtype inference handled by pandas defaults
-        # No speculative parameters.
         df = pd.read_csv(file_path)
     except FileNotFoundError:
         raise ValidationError(f"File not found: {file_path}")
     except pd.errors.EmptyDataError:
         raise ValidationError("Input file is empty")
     except Exception as e:
-        # Catch only unexpected IO errors, wrap in domain exception
         raise ValidationError(f"Failed to load CSV: {str(e)}")
 
     # Validate Structure
-    # This call enforces the "Single, Irreversible Failure Mode"
     result = validate_dataframe_structure(df, CONFIG)
     
-    # Assert post-condition (Completeness of assumptions)
+    # Assert post-condition
     assert result.success is True, "Validation logic failed to raise exception on error"
     assert result.row_count > 0, "Validated dataset must contain rows"
     
@@ -221,19 +213,14 @@ def load_and_validate(file_path: str) -> pd.DataFrame:
 # ==============================================================================
 
 if __name__ == "__main__":
-    # Hardcoded path per task context for immediate deployability in this specific instance
-    # In a real pipeline, this would be injected, but per "No Future-Proofing" rule:
     target_file = r"D:\applied-finance-ml\project-01-flat-variance-detector\data\raw\synthetic_prices.csv"
     
     try:
         validated_df = load_and_validate(target_file)
-        # Minimal output to confirm success without bloating stdout
         print(f"VALIDATION_SUCCESS: Rows={len(validated_df)}, Version={CONFIG.schema_version}")
     except ValidationError as e:
-        # Single Failure Mode: Print deterministic error and exit non-zero
         print(f"VALIDATION_FAILURE: {e}")
         raise SystemExit(1)
     except Exception as e:
-        # Catch-all for truly unexpected system errors (should not happen if standards met)
         print(f"CRITICAL_SYSTEM_ERROR: {e}")
         raise SystemExit(2)
