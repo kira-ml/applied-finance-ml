@@ -1,171 +1,82 @@
-# Architecture: Flat/Variance Transaction Detector
+# Architecture Decision Record
 
-## 1. Problem
+*This document outlines the design choices for my flat transaction detection project. I'm a machine learning student building this to understand data quality monitoring fundamentals. These decisions reflect what I've learned about keeping things simple while building something that works.*
 
-**What:** Detect "stuck" data feeds where prices stop changing.
+## Why This Architecture?
 
-**Why:** Stuck feeds corrupt downstream models and risk calculations.
+I need to detect when price data goes flat (stops changing) in financial feeds. The core insight: this doesn't require machine learning - it's a rolling statistics check. My architecture prioritizes:
 
-**How:** Flag assets when rolling standard deviation falls below threshold.
+- **Running on my laptop** (Intel i5, no GPU)
+- **Being understandable** when I revisit it in 6 months
+- **Easy modification** as I learn what works
+- **No infrastructure debt** - I want to learn detection, not DevOps
 
-**Success Metric:** Precision (minimize false alarms). Secondary: detection latency.
+## Component Choices
 
-**Not Building:** ML models, real-time streaming, distributed systems, APIs.
+| Stage | What I'm Using | Why I Chose It |
+|-------|----------------|----------------|
+| **Data Loading** | `pandas.read_csv()` | CSV is universal; pandas handles time series well and I'm already learning it |
+| **Data Storage** | File system with dated files | No database setup needed; I can see my data directly |
+| **Validation** | pandas assertions | A few lines check what matters (columns, nulls, types) |
+| **Detection** | `rolling().std()` + threshold | 5 lines of code; leverages pandas speed; matches the math of "flatness" |
+| **Alerting** | Print + log file | I'll be running this manually at first; log file keeps history |
+| **Results** | CSV output | Easy to open in Excel, share with others, or feed into reports |
+| **Orchestration** | Run script manually → later add cron | No tool learning curve; cron is built into my OS |
+| **Version Control** | Git (local) | Tracks my changes; I can experiment with branches |
+| **Experiment Tracking** | Comments + dated files | I'm not tuning hyperparameters; the "model" is a fixed rule |
 
-## 2. Pipeline
+## How Data Moves Through the System
 
-```
-CSV → Validate → Rolling Std → Threshold → Flags → Review → Iterate
-```
+**Start → End**
 
-1. **CSV:** Daily prices: date, ticker, close_price
-2. **Validate:** Check schema, missing data, price ranges
-3. **Rolling Std:** 5-day window per asset
-4. **Threshold:** If std < 0.01 → flag = 1
-5. **Flags:** Save to CSV with asset, date, flag
-6. **Review:** Analyst marks false positives
-7. **Iterate:** Tune window/threshold based on review
+1. **Get data**: Look in `data/raw/` for today's CSV file
+2. **Check it**: Make sure columns exist, dates parse, no missing prices
+3. **Process**: Group by asset, calculate 5-day rolling standard deviation
+4. **Flag**: If rolling std dev < 0.01, mark as flat
+5. **Alert**: Print summary to screen, write flagged rows to `logs/alerts.log`
+6. **Save**: Write full results to `outputs/` with timestamp
+7. **Archive**: Move processed file to `data/processed/`
 
-## 3. Data
+## What I'm Not Using (And Why)
 
-**Assumptions:**
-- CSV with columns: date, ticker, close_price
-- 10 tickers, 2 years daily
-- Prices in dollars (not pennies)
+- **Docker** - I'm running on my laptop directly; one more layer to learn/debug
+- **Airflow** - Cron or manual execution is simpler for daily runs
+- **Database** - CSV files work fine for 10 stocks × 2 years (~7k rows)
+- **MLflow** - No model parameters to track; code comments suffice
+- **REST API** - I'll read output files directly; no need for endpoints
+- **Kafka** - Data arrives as daily files, not real-time streams
+- **Fancy ML models** - Flat lines don't need autoencoders; a threshold works
 
-**Storage:**
-- `data/raw/` - input CSVs
-- `data/processed/` - output flags
-- `experiments/run_N/` - per-run results
-
-**Validation:**
-- Check expected columns exist
-- No negative/zero prices
-- Missing data <5% per ticker
-
-## 4. Features
-
-**One feature:** rolling standard deviation of close_price.
-
-```python
-# Complete feature engineering
-rolling_std = df.groupby('ticker')['close_price'].rolling(5).std()
-flags = (rolling_std < 0.01).astype(int)
-```
-
-**Why:** Flat data has zero variance. Variance measured by std dev.
-
-## 5. Model
-
-**Not a model.** This is a rule:
-
-```
-if rolling_std < threshold:
-    flag = 1
-else:
-    flag = 0
-```
-
-**Parameters to tune:** window size [3,5,7,10], threshold [0.005,0.01,0.02,0.05]
-
-## 6. Validation
-
-**Split:** First 18 months tune, last 6 months evaluate.
-
-**Tuning:** Grid search parameters to maximize precision on validation set.
-
-**Reproducibility:** Save config JSON per run.
-
-```json
-{
-  "window": 5,
-  "threshold": 0.01,
-  "min_periods": 3,
-  "validation_start": "2023-07-01"
-}
-```
-
-## 7. Evaluation
-
-**Metrics:**
-- Precision = true flags / total flags
-- Latency = days from flat start to first flag
-
-**Error Analysis:**
-- Review each flag: "Was this actually flat?"
-- Log false positives
-- Look for patterns (low-price assets, specific dates)
-
-## 8. Experiment Tracking
-
-```
-experiments/
-├── run_001/
-│   ├── config.json
-│   ├── flags.csv
-│   └── metrics.txt
-├── run_002/
-└── experiment_log.csv
-```
-
-**metrics.txt example:**
-```
-precision: 0.92
-latency_days: 2.3
-false_positives: 3
-notes: T-bills flagged, need adjusted threshold
-```
-
-## 9. Inference
-
-**Batch only:** Run daily after market close.
-
-```bash
-python run.py --config configs/run_001.json
-```
-
-Output: `experiments/run_001/flags.csv`
-
-Analyst reviews CSV directly. No dashboards, no APIs.
-
-## 10. Iteration
-
-**Loop:**
-1. Run detector
-2. Review false positives
-3. Adjust threshold/window
-4. New run, compare metrics
-
-**Next:**
-- Multi-window voting (3,5,7 day windows)
-- Price normalization if needed
-- That's it.
-
----
-
-## Files
+## Project Structure
 
 ```
 flat-detector/
-├── run.py                 # orchestrator
-├── src/
-│   ├── simulate.py        # generate test data
-│   ├── validate.py        # check input data
-│   ├── detect.py          # rolling std + threshold
-│   └── review.py          # false positive review
-├── configs/               # JSON parameters
 ├── data/
-│   ├── raw/               # input CSVs
-│   └── processed/         # output flags
-├── experiments/           # run results
-└── requirements.txt       # pandas, numpy
+│   ├── raw/          # Drop new CSV files here
+│   └── processed/    # Files move here after processing
+├── logs/
+│   └── alerts.log    # Flat detection history
+├── outputs/          # Results with flags (dated + latest)
+├── src/
+│   └── detect_flat.py
+└── ARCHITECTURE.md   # This file
 ```
 
-## Non-Goals
+## What Success Looks Like
 
-- ❌ No ML models (autoencoders, isolation forests)
-- ❌ No real-time processing
-- ❌ No API servers
-- ❌ No dashboards
-- ❌ No distributed computing
-- ❌ No MLOps platforms
+1. **Precision** - Most flags are real flat periods, not stable assets
+2. **Latency** - Flag appears when flat period reaches 5 days
+3. **Understandability** - I can explain the logic to someone else in 2 minutes
+
+## Things I Might Change Later
+
+- Add command-line arguments for threshold/window size
+- Generate test data with known flat periods for validation
+- Add a simple summary report with charts
+- Email alerts if this becomes part of daily workflow
+
+*But I'll only add these if I actually need them.*
+
+---
+
+*Last updated: February 2026*
