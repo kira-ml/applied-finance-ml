@@ -7,12 +7,17 @@ Core Responsibilities:
 - Validate target variable distribution consistency across splits.
 - Return pandas DataFrames for each split.
 
+Alignment with config.py:
+- Target Column: Defaults to "default" (as per Config.target_column).
+- Split Ratios: 0.60 / 0.20 / 0.20 (as per Config.split_ratios).
+- Random Seed: 42 (as per Config.random_seed).
+- Precision: Uses Decimal for ratio calculations to match Config's financial precision standards.
+
 Constraints:
 - Strict static typing.
-- Deterministic execution (fixed random seed).
+- Deterministic execution.
 - Immutable state enforcement.
 - Explicit exception contracts.
-- No external configuration or environment reliance.
 """
 
 from __future__ import annotations
@@ -24,14 +29,20 @@ from typing import Final, List, Tuple, TypeVar
 import pandas as pd
 
 # -----------------------------------------------------------------------------
-# Constants & Configuration
+# Constants & Configuration (Synchronized with config.py)
 # -----------------------------------------------------------------------------
 
-_TARGET_COLUMN_NAME: Final[str] = "target"
+# Matches Config.target_column = "default"
+_DEFAULT_TARGET_COLUMN_NAME: Final[str] = "default"
+
+# Matches Config.split_ratios (train=0.60, calibration=0.20, test=0.20)
 _TRAIN_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.60")
 _CALIB_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.20")
 _TEST_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.20")
+
+# Matches Config.random_seed = 42 and ModelHyperparameters.random_state = 42
 _RANDOM_SEED: Final[int] = 42
+
 _MAX_ROWS_BOUND: Final[int] = 10_000_000
 _DEFAULT_TOLERANCE: Final[str] = "0.02"
 
@@ -211,36 +222,29 @@ def _stratified_split(
     calib_parts: List[pd.DataFrame] = []
     test_parts: List[pd.DataFrame] = []
     
-    # Group by target to ensure stratification
     grouped = df.groupby(target_col, sort=True)
     
     for _, group_df in grouped:
         n_total = len(group_df)
         
-        # Deterministic shuffle within the group
         shuffled_group = group_df.sample(frac=1.0, random_state=seed, ignore_index=True)
         
-        # Calculate boundaries
         n_train = int((decimal.Decimal(n_total) * _TRAIN_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
         n_calib = int((decimal.Decimal(n_total) * _CALIB_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
         n_test = n_total - n_train - n_calib
         
         if n_train == 0 or n_calib == 0 or n_test == 0:
-            # If a specific class is too small to split, the whole dataset is effectively too small
-            # for a valid 3-way stratified split.
             raise SplitValidationError("Dataset too small to perform valid three-way split with given ratios.")
         
         train_parts.append(shuffled_group.iloc[:n_train])
         calib_parts.append(shuffled_group.iloc[n_train:n_train + n_calib])
         test_parts.append(shuffled_group.iloc[n_train + n_calib:])
     
-    # Concatenate and reset index to create clean, immutable new instances
     train_df = pd.concat(train_parts, ignore_index=True)
     calib_df = pd.concat(calib_parts, ignore_index=True)
     test_df = pd.concat(test_parts, ignore_index=True)
     
-    # Final deterministic sort to ensure byte-level reproducibility regardless of group iteration order
-    # Although groupby(sort=True) helps, explicit sorting guarantees stability.
+    # Deterministic sort for byte-level reproducibility
     train_df = train_df.sort_values(by=list(train_df.columns)).reset_index(drop=True)
     calib_df = calib_df.sort_values(by=list(calib_df.columns)).reset_index(drop=True)
     test_df = test_df.sort_values(by=list(test_df.columns)).reset_index(drop=True)
@@ -254,7 +258,7 @@ def _stratified_split(
 
 def load_and_split_data(
     file_path: str,
-    target_col: str = _TARGET_COLUMN_NAME,
+    target_col: str = _DEFAULT_TARGET_COLUMN_NAME,
     stratification_tolerance: str = _DEFAULT_TOLERANCE
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
@@ -263,8 +267,8 @@ def load_and_split_data(
     
     Args:
         file_path: Absolute path to the raw CSV file.
-        target_col: Name of the target variable column.
-        stratification_tolerance: Maximum allowed deviation in class proportions (as decimal string).
+        target_col: Name of the target variable column (Default: "default" per config.py).
+        stratification_tolerance: Maximum allowed deviation in class proportions.
         
     Returns:
         A tuple containing (Train DataFrame, Calibration DataFrame, Test DataFrame).
@@ -275,7 +279,7 @@ def load_and_split_data(
         DataValidationError: If schema checks fail.
         SplitValidationError: If stratification validation fails.
         
-    Time Complexity: O(N log N) due to sorting within groups and final concat sort.
+    Time Complexity: O(N log N)
     Space Complexity: O(N)
     """
     tolerance_dec: decimal.Decimal = decimal.Decimal(stratification_tolerance)
