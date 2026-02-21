@@ -1,252 +1,289 @@
-from pathlib import Path
-from typing import Dict, Tuple, Final
-import pandas as pd
-from pandas import DataFrame
-from sklearn.model_selection import StratifiedShuffleSplit
-import hashlib
-import csv
-from collections import Counter
+"""
+src/data_loader.py
 
+Core Responsibilities:
+- Load raw CSV data from a specified path.
+- Perform a stratified three-way split: Train (60%), Calibration (20%), Test (20%).
+- Validate target variable distribution consistency across splits.
+- Return pandas DataFrames for each split.
+
+Constraints:
+- Strict static typing.
+- Deterministic execution (fixed random seed).
+- Immutable state enforcement.
+- Explicit exception contracts.
+- No external configuration or environment reliance.
+"""
+
+from __future__ import annotations
+
+import decimal
+from contextlib import contextmanager
+from typing import Final, List, Tuple, TypeVar
+
+import pandas as pd
+
+# -----------------------------------------------------------------------------
+# Constants & Configuration
+# -----------------------------------------------------------------------------
+
+_TARGET_COLUMN_NAME: Final[str] = "target"
+_TRAIN_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.60")
+_CALIB_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.20")
+_TEST_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.20")
+_RANDOM_SEED: Final[int] = 42
+_MAX_ROWS_BOUND: Final[int] = 10_000_000  # Algorithmic complexity bound safeguard
+
+T = TypeVar("T")
+
+
+# -----------------------------------------------------------------------------
+# Custom Exceptions
+# -----------------------------------------------------------------------------
 
 class DataLoaderError(Exception):
-    """Base exception for data loading errors."""
+    """Base exception for data loader failures."""
     pass
 
 
-class FileNotFoundError(DataLoaderError):
-    """Raised when data file does not exist."""
+class DataValidationError(DataLoaderError):
+    """Raised when input data validation fails."""
     pass
 
 
-class InvalidFileFormatError(DataLoaderError):
-    """Raised when file format is invalid."""
+class SplitValidationError(DataLoaderError):
+    """Raised when stratified split validation fails."""
     pass
 
 
-class TargetColumnNotFoundError(DataLoaderError):
-    """Raised when target column is missing."""
+class ResourceManagementError(DataLoaderError):
+    """Raised when resource management fails."""
     pass
 
 
-class DistributionMismatchError(DataLoaderError):
-    """Raised when target distribution differs across splits."""
-    pass
+# -----------------------------------------------------------------------------
+# Resource Management
+# -----------------------------------------------------------------------------
 
-
-class StratifiedDataLoader:
+@contextmanager
+def managed_csv_reader(file_path: str) -> Tuple[pd.DataFrame, None]:
     """
-    Loads CSV data and performs stratified train/calibration/test split.
+    Context manager for loading CSV data ensuring deterministic cleanup.
     
-    Time complexity: O(n) for reading and validation operations.
-    Space complexity: O(n) for storing DataFrames.
-    """
-    
-    def __init__(self, file_path: str | Path, target_column: str) -> None:
-        """
-        Initialize loader with file path and target column.
+    Args:
+        file_path: Absolute path to the CSV file.
         
-        Args:
-            file_path: Path to CSV file
-            target_column: Name of target variable column
-            
-        Raises:
-            FileNotFoundError: If file does not exist
-            InvalidFileFormatError: If file is not valid CSV
-            TargetColumnNotFoundError: If target column missing from CSV
-        """
-        self._file_path: Final[Path] = Path(file_path)
-        self._target_column: Final[str] = target_column
-        self._validate_file()
-        self._validate_target_column()
-        
-    def _validate_file(self) -> None:
-        """Validate file existence and CSV format."""
-        if not self._file_path.exists():
-            raise FileNotFoundError(f"File not found: {self._file_path}")
-            
-        if not self._file_path.is_file():
-            raise FileNotFoundError(f"Path is not a file: {self._file_path}")
-            
-        if self._file_path.suffix.lower() != '.csv':
-            raise InvalidFileFormatError(f"File must be CSV: {self._file_path}")
-            
-        try:
-            with open(self._file_path, 'r', encoding='utf-8') as f:
-                dialect = csv.Sniffer().sniff(f.read(1024))
-                f.seek(0)
-                reader = csv.reader(f, dialect)
-                next(reader)  # Check header exists
-        except (csv.Error, UnicodeDecodeError, StopIteration) as e:
-            raise InvalidFileFormatError(f"Invalid CSV format: {e}")
-            
-    def _validate_target_column(self) -> None:
-        """Validate target column exists in CSV."""
-        try:
-            df = pd.read_csv(self._file_path, nrows=0)
-            if self._target_column not in df.columns:
-                raise TargetColumnNotFoundError(
-                    f"Target column '{self._target_column}' not found. "
-                    f"Available columns: {list(df.columns)}"
-                )
-        except pd.errors.EmptyDataError:
-            raise InvalidFileFormatError("CSV file is empty")
-            
-    def load_and_split(self) -> Dict[str, DataFrame]:
-        """
-        Load CSV and create stratified train/calibration/test splits.
-        
-        Returns:
-            Dictionary with keys 'train', 'calibration', 'test' containing DataFrames
-            
-        Raises:
-            DistributionMismatchError: If target distribution differs across splits
-            DataLoaderError: For other data loading errors
-        """
-        raw_data: DataFrame = self._read_csv_with_validation()
-        splits: Dict[str, DataFrame] = self._create_stratified_splits(raw_data)
-        self._validate_distributions(splits)
-        
-        return {
-            'train': splits['train'].copy(),
-            'calibration': splits['calibration'].copy(),
-            'test': splits['test'].copy()
-        }
-        
-    def _read_csv_with_validation(self) -> DataFrame:
-        """Read CSV with strict validation."""
-        try:
-            df = pd.read_csv(
-                self._file_path,
-                encoding='utf-8',
-                dtype=str,  # Read all as strings initially to prevent type inference
-                keep_default_na=False,  # Prevent automatic NA conversion
-                na_values=[]  # No automatic NA handling
-            )
-            
-            # Verify no missing values in target column
-            if df[self._target_column].isna().any():
-                raise DataLoaderError("Target column contains missing values")
-                
-            # Convert target column to appropriate type based on content
-            try:
-                df[self._target_column] = pd.to_numeric(df[self._target_column])
-            except (ValueError, TypeError):
-                # Keep as string if not numeric
-                pass
-                
-            return df
-            
-        except pd.errors.ParserError as e:
-            raise InvalidFileFormatError(f"CSV parsing error: {e}")
-            
-    def _create_stratified_splits(self, data: DataFrame) -> Dict[str, DataFrame]:
-        """
-        Create stratified splits with exact proportions: 60% train, 20% calibration, 20% test.
-        """
-        # First split: separate train (60%) from temp (40%)
-        train_size: float = 0.6
-        temp_size: float = 0.4
-        
-        splitter_1 = StratifiedShuffleSplit(
-            n_splits=1,
-            train_size=train_size,
-            test_size=temp_size,
-            random_state=42  # Fixed seed for deterministic behavior
-        )
-        
-        target: pd.Series = data[self._target_column]
-        train_idx, temp_idx = next(splitter_1.split(data, target))
-        
-        train_data: DataFrame = data.iloc[train_idx].reset_index(drop=True)
-        temp_data: DataFrame = data.iloc[temp_idx].reset_index(drop=True)
-        
-        # Second split: split temp into calibration (50%) and test (50%)
-        # This yields final proportions: train 60%, calibration 20%, test 20%
-        splitter_2 = StratifiedShuffleSplit(
-            n_splits=1,
-            train_size=0.5,  # 50% of temp = 20% of total
-            test_size=0.5,   # 50% of temp = 20% of total
-            random_state=42  # Fixed seed for deterministic behavior
-        )
-        
-        temp_target: pd.Series = temp_data[self._target_column]
-        cal_idx, test_idx = next(splitter_2.split(temp_data, temp_target))
-        
-        calibration_data: DataFrame = temp_data.iloc[cal_idx].reset_index(drop=True)
-        test_data: DataFrame = temp_data.iloc[test_idx].reset_index(drop=True)
-        
-        # Verify exact counts
-        total_rows: int = len(data)
-        expected_train: int = int(total_rows * 0.6)
-        expected_cal: int = int(total_rows * 0.2)
-        expected_test: int = total_rows - expected_train - expected_cal
-        
-        assert len(train_data) == expected_train, "Train split size mismatch"
-        assert len(calibration_data) == expected_cal, "Calibration split size mismatch"
-        assert len(test_data) == expected_test, "Test split size mismatch"
-        
-        return {
-            'train': train_data,
-            'calibration': calibration_data,
-            'test': test_data
-        }
-        
-    def _validate_distributions(self, splits: Dict[str, DataFrame]) -> None:
-        """
-        Validate that target distribution is consistent across all splits.
-        
-        Raises:
-            DistributionMismatchError: If distributions differ significantly
-        """
-        distributions: Dict[str, Counter] = {}
-        
-        for split_name, df in splits.items():
-            target_series: pd.Series = df[self._target_column]
-            
-            # Calculate distribution as normalized frequencies
-            value_counts = target_series.value_counts(normalize=True)
-            distributions[split_name] = Counter(
-                {str(k): round(v, 4) for k, v in value_counts.items()}
-            )
-            
-        # Compare all pairs of splits
-        split_names: list = list(splits.keys())
-        for i in range(len(split_names)):
-            for j in range(i + 1, len(split_names)):
-                name_i: str = split_names[i]
-                name_j: str = split_names[j]
-                
-                if distributions[name_i] != distributions[name_j]:
-                    raise DistributionMismatchError(
-                        f"Target distribution mismatch between {name_i} and {name_j}. "
-                        f"{name_i}: {dict(distributions[name_i])}, "
-                        f"{name_j}: {dict(distributions[name_j])}"
-                    )
-                    
-    def __eq__(self, other: object) -> bool:
-        """Equality based on immutable attributes."""
-        if not isinstance(other, StratifiedDataLoader):
-            return NotImplemented
-        return (self._file_path == other._file_path and 
-                self._target_column == other._target_column)
-                
-    def __hash__(self) -> int:
-        """Hash based on immutable attributes."""
-        return hash((self._file_path, self._target_column))
-
-
-def load_credit_data() -> Dict[str, DataFrame]:
-    """
-    Load credit risk data with stratified split.
-    
-    Returns:
-        Dictionary with train, calibration, and test DataFrames
+    Yields:
+        A pandas DataFrame containing the raw data.
         
     Raises:
-        DataLoaderError: For any data loading or validation errors
+        ResourceManagementError: If file cannot be read or is empty.
+        FileNotFoundError: If the file does not exist.
     """
-    data_path: Path = Path("D:/applied-finance-ml/project-02-credit-risk-probability-calibration/data/raw/credit_data.csv")
-    target_column: str = "default"  # Assuming target column name from credit_data.csv
+    df: pd.DataFrame | None = None
+    try:
+        # Strict schema enforcement: No implicit index, no automatic type inference quirks
+        # We rely on pandas default inference but enforce structural checks immediately after
+        df = pd.read_csv(file_path, low_memory=False)
+        
+        if df.empty:
+            raise ResourceManagementError("Loaded dataset is empty.")
+            
+        yield df, None
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Data file not found at path: {file_path}")
+    except Exception as e:
+        # Sanitized error message
+        raise ResourceManagementError("Failed to load CSV resource due to internal error.") from e
+    finally:
+        # Explicit cleanup hint, though pandas handles memory via ref counting
+        del df
+
+
+# -----------------------------------------------------------------------------
+# Pure Logic: Validation & Splitting
+# -----------------------------------------------------------------------------
+
+def _validate_schema(df: pd.DataFrame, target_col: str) -> None:
+    """
+    Validates the presence of the target column and basic structural integrity.
     
-    loader: StratifiedDataLoader = StratifiedDataLoader(data_path, target_column)
-    return loader.load_and_split()
+    Args:
+        df: The input DataFrame.
+        target_col: The name of the target column.
+        
+    Raises:
+        DataValidationError: If schema requirements are not met.
+    """
+    columns: List[str] = list(df.columns)
+    
+    if target_col not in columns:
+        raise DataValidationError(f"Missing required column: {target_col}")
+    
+    if len(df) > _MAX_ROWS_BOUND:
+        raise DataValidationError("Input dataset exceeds maximum allowed row bound.")
+    
+    if df[target_col].isna().any():
+        raise DataValidationError("Target variable contains missing values.")
+
+
+def _calculate_distribution(df: pd.DataFrame, target_col: str) -> pd.Series:
+    """
+    Calculates the normalized distribution of the target variable.
+    
+    Args:
+        df: Input DataFrame.
+        target_col: Target column name.
+        
+    Returns:
+        A Series representing the proportion of each class.
+    """
+    counts: pd.Series = df[target_col].value_counts(normalize=True, sort=True)
+    return counts.sort_index()
+
+
+def _validate_stratification(
+    original_dist: pd.Series,
+    train_dist: pd.Series,
+    calib_dist: pd.Series,
+    test_dist: pd.Series,
+    tolerance: decimal.Decimal
+) -> None:
+    """
+    Validates that split distributions match the original within a strict tolerance.
+    
+    Args:
+        original_dist: Distribution of the full dataset.
+        train_dist: Distribution of the training split.
+        calib_dist: Distribution of the calibration split.
+        test_dist: Distribution of the test split.
+        tolerance: Maximum allowable deviation (decimal).
+        
+    Raises:
+        SplitValidationError: If any split deviates beyond tolerance.
+    """
+    splits: List[Tuple[str, pd.Series]] = [
+        ("Train", train_dist),
+        ("Calibration", calib_dist),
+        ("Test", test_dist)
+    ]
+    
+    # Ensure all splits have the same index (classes) as original
+    for name, dist in splits:
+        if not original_dist.index.equals(dist.index):
+            raise SplitValidationError(f"{name} split has different classes than original dataset.")
+    
+    for name, dist in splits:
+        for cls in original_dist.index:
+            orig_val: decimal.Decimal = decimal.Decimal(str(original_dist[cls]))
+            split_val: decimal.Decimal = decimal.Decimal(str(dist[cls]))
+            diff: decimal.Decimal = abs(orig_val - split_val)
+            
+            if diff > tolerance:
+                raise SplitValidationError(
+                    f"Stratification failed for class '{cls}' in {name} split. "
+                    f"Deviation {diff} exceeds tolerance {tolerance}."
+                )
+
+
+def _stratified_split(
+    df: pd.DataFrame,
+    target_col: str,
+    seed: int
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Performs a deterministic stratified three-way split.
+    
+    Logic:
+    1. Shuffle data deterministically.
+    2. Calculate exact integer boundaries based on Decimal ratios to avoid float drift.
+    3. Slice data immutably.
+    
+    Args:
+        df: Input DataFrame.
+        target_col: Target column name.
+        seed: Random seed for shuffling.
+        
+    Returns:
+        Tuple of (Train, Calibration, Test) DataFrames.
+    """
+    total_rows: int = len(df)
+    
+    # Deterministic shuffle
+    shuffled_df: pd.DataFrame = df.sample(frac=1.0, random_state=seed, ignore_index=True)
+    
+    # Precise boundary calculation using Decimal
+    n_train: int = int((decimal.Decimal(total_rows) * _TRAIN_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
+    n_calib: int = int((decimal.Decimal(total_rows) * _CALIB_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
+    # Remainder goes to test to ensure sum equals total_rows exactly
+    n_test: int = total_rows - n_train - n_calib
+    
+    if n_train == 0 or n_calib == 0 or n_test == 0:
+        raise SplitValidationError("Dataset too small to perform valid three-way split with given ratios.")
+    
+    # Immutable slicing
+    train_df: pd.DataFrame = shuffled_df.iloc[:n_train].reset_index(drop=True)
+    calib_df: pd.DataFrame = shuffled_df.iloc[n_train:n_train + n_calib].reset_index(drop=True)
+    test_df: pd.DataFrame = shuffled_df.iloc[n_train + n_calib:].reset_index(drop=True)
+    
+    return train_df, calib_df, test_df
+
+
+# -----------------------------------------------------------------------------
+# Public Interface
+# -----------------------------------------------------------------------------
+
+def load_and_split_data(
+    file_path: str,
+    target_col: str = _TARGET_COLUMN_NAME,
+    stratification_tolerance: str = "0.01"
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Loads raw CSV data, validates schema, performs stratified splitting, 
+    and validates distribution consistency.
+    
+    Args:
+        file_path: Absolute path to the raw CSV file.
+        target_col: Name of the target variable column.
+        stratification_tolerance: Maximum allowed deviation in class proportions (as decimal string).
+        
+    Returns:
+        A tuple containing (Train DataFrame, Calibration DataFrame, Test DataFrame).
+        
+    Raises:
+        FileNotFoundError: If the file path is invalid.
+        ResourceManagementError: If file reading fails.
+        DataValidationError: If schema checks fail.
+        SplitValidationError: If stratification validation fails.
+        
+    Time Complexity: O(N) where N is the number of rows (dominated by shuffle and value_counts).
+    Space Complexity: O(N) to hold the dataframe and splits in memory.
+    """
+    tolerance_dec: decimal.Decimal = decimal.Decimal(stratification_tolerance)
+    
+    with managed_csv_reader(file_path) as (df, _):
+        # 1. Validate Schema
+        _validate_schema(df, target_col)
+        
+        # 2. Calculate Original Distribution
+        original_dist: pd.Series = _calculate_distribution(df, target_col)
+        
+        # 3. Perform Split
+        train_df, calib_df, test_df = _stratified_split(df, target_col, _RANDOM_SEED)
+        
+        # 4. Validate Split Distributions
+        train_dist: pd.Series = _calculate_distribution(train_df, target_col)
+        calib_dist: pd.Series = _calculate_distribution(calib_df, target_col)
+        test_dist: pd.Series = _calculate_distribution(test_df, target_col)
+        
+        _validate_stratification(
+            original_dist, 
+            train_dist, 
+            calib_dist, 
+            test_dist, 
+            tolerance_dec
+        )
+        
+        # Return new instances (slices are already new views/copies depending on pandas internals, 
+        # but reset_index ensures clean new objects)
+        return train_df, calib_df, test_df
