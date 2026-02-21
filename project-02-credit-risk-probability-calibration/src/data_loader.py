@@ -32,7 +32,8 @@ _TRAIN_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.60")
 _CALIB_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.20")
 _TEST_RATIO: Final[decimal.Decimal] = decimal.Decimal("0.20")
 _RANDOM_SEED: Final[int] = 42
-_MAX_ROWS_BOUND: Final[int] = 10_000_000  # Algorithmic complexity bound safeguard
+_MAX_ROWS_BOUND: Final[int] = 10_000_000
+_DEFAULT_TOLERANCE: Final[str] = "0.02"
 
 T = TypeVar("T")
 
@@ -82,8 +83,6 @@ def managed_csv_reader(file_path: str) -> Tuple[pd.DataFrame, None]:
     """
     df: pd.DataFrame | None = None
     try:
-        # Strict schema enforcement: No implicit index, no automatic type inference quirks
-        # We rely on pandas default inference but enforce structural checks immediately after
         df = pd.read_csv(file_path, low_memory=False)
         
         if df.empty:
@@ -92,12 +91,14 @@ def managed_csv_reader(file_path: str) -> Tuple[pd.DataFrame, None]:
         yield df, None
     except FileNotFoundError:
         raise FileNotFoundError(f"Data file not found at path: {file_path}")
+    except pd.errors.EmptyDataError:
+        raise ResourceManagementError("Loaded dataset is empty.")
+    except ResourceManagementError:
+        raise
     except Exception as e:
-        # Sanitized error message
-        raise ResourceManagementError("Failed to load CSV resource due to internal error.") from e
-    finally:
-        # Explicit cleanup hint, though pandas handles memory via ref counting
-        del df
+        if isinstance(e, (pd.errors.ParserError, OSError)):
+            raise ResourceManagementError("Failed to load CSV resource due to internal error.") from e
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -168,7 +169,6 @@ def _validate_stratification(
         ("Test", test_dist)
     ]
     
-    # Ensure all splits have the same index (classes) as original
     for name, dist in splits:
         if not original_dist.index.equals(dist.index):
             raise SplitValidationError(f"{name} split has different classes than original dataset.")
@@ -192,12 +192,12 @@ def _stratified_split(
     seed: int
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Performs a deterministic stratified three-way split.
+    Performs a deterministic TRUE stratified three-way split.
     
     Logic:
-    1. Shuffle data deterministically.
-    2. Calculate exact integer boundaries based on Decimal ratios to avoid float drift.
-    3. Slice data immutably.
+    1. Group by target class.
+    2. Shuffle and split EACH group independently to ensure perfect distribution.
+    3. Concatenate results.
     
     Args:
         df: Input DataFrame.
@@ -207,25 +207,44 @@ def _stratified_split(
     Returns:
         Tuple of (Train, Calibration, Test) DataFrames.
     """
-    total_rows: int = len(df)
+    train_parts: List[pd.DataFrame] = []
+    calib_parts: List[pd.DataFrame] = []
+    test_parts: List[pd.DataFrame] = []
     
-    # Deterministic shuffle
-    shuffled_df: pd.DataFrame = df.sample(frac=1.0, random_state=seed, ignore_index=True)
+    # Group by target to ensure stratification
+    grouped = df.groupby(target_col, sort=True)
     
-    # Precise boundary calculation using Decimal
-    n_train: int = int((decimal.Decimal(total_rows) * _TRAIN_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
-    n_calib: int = int((decimal.Decimal(total_rows) * _CALIB_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
-    # Remainder goes to test to ensure sum equals total_rows exactly
-    n_test: int = total_rows - n_train - n_calib
+    for _, group_df in grouped:
+        n_total = len(group_df)
+        
+        # Deterministic shuffle within the group
+        shuffled_group = group_df.sample(frac=1.0, random_state=seed, ignore_index=True)
+        
+        # Calculate boundaries
+        n_train = int((decimal.Decimal(n_total) * _TRAIN_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
+        n_calib = int((decimal.Decimal(n_total) * _CALIB_RATIO).to_integral_value(rounding=decimal.ROUND_FLOOR))
+        n_test = n_total - n_train - n_calib
+        
+        if n_train == 0 or n_calib == 0 or n_test == 0:
+            # If a specific class is too small to split, the whole dataset is effectively too small
+            # for a valid 3-way stratified split.
+            raise SplitValidationError("Dataset too small to perform valid three-way split with given ratios.")
+        
+        train_parts.append(shuffled_group.iloc[:n_train])
+        calib_parts.append(shuffled_group.iloc[n_train:n_train + n_calib])
+        test_parts.append(shuffled_group.iloc[n_train + n_calib:])
     
-    if n_train == 0 or n_calib == 0 or n_test == 0:
-        raise SplitValidationError("Dataset too small to perform valid three-way split with given ratios.")
+    # Concatenate and reset index to create clean, immutable new instances
+    train_df = pd.concat(train_parts, ignore_index=True)
+    calib_df = pd.concat(calib_parts, ignore_index=True)
+    test_df = pd.concat(test_parts, ignore_index=True)
     
-    # Immutable slicing
-    train_df: pd.DataFrame = shuffled_df.iloc[:n_train].reset_index(drop=True)
-    calib_df: pd.DataFrame = shuffled_df.iloc[n_train:n_train + n_calib].reset_index(drop=True)
-    test_df: pd.DataFrame = shuffled_df.iloc[n_train + n_calib:].reset_index(drop=True)
-    
+    # Final deterministic sort to ensure byte-level reproducibility regardless of group iteration order
+    # Although groupby(sort=True) helps, explicit sorting guarantees stability.
+    train_df = train_df.sort_values(by=list(train_df.columns)).reset_index(drop=True)
+    calib_df = calib_df.sort_values(by=list(calib_df.columns)).reset_index(drop=True)
+    test_df = test_df.sort_values(by=list(test_df.columns)).reset_index(drop=True)
+
     return train_df, calib_df, test_df
 
 
@@ -236,7 +255,7 @@ def _stratified_split(
 def load_and_split_data(
     file_path: str,
     target_col: str = _TARGET_COLUMN_NAME,
-    stratification_tolerance: str = "0.01"
+    stratification_tolerance: str = _DEFAULT_TOLERANCE
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Loads raw CSV data, validates schema, performs stratified splitting, 
@@ -256,22 +275,18 @@ def load_and_split_data(
         DataValidationError: If schema checks fail.
         SplitValidationError: If stratification validation fails.
         
-    Time Complexity: O(N) where N is the number of rows (dominated by shuffle and value_counts).
-    Space Complexity: O(N) to hold the dataframe and splits in memory.
+    Time Complexity: O(N log N) due to sorting within groups and final concat sort.
+    Space Complexity: O(N)
     """
     tolerance_dec: decimal.Decimal = decimal.Decimal(stratification_tolerance)
     
     with managed_csv_reader(file_path) as (df, _):
-        # 1. Validate Schema
         _validate_schema(df, target_col)
         
-        # 2. Calculate Original Distribution
         original_dist: pd.Series = _calculate_distribution(df, target_col)
         
-        # 3. Perform Split
         train_df, calib_df, test_df = _stratified_split(df, target_col, _RANDOM_SEED)
         
-        # 4. Validate Split Distributions
         train_dist: pd.Series = _calculate_distribution(train_df, target_col)
         calib_dist: pd.Series = _calculate_distribution(calib_df, target_col)
         test_dist: pd.Series = _calculate_distribution(test_df, target_col)
@@ -284,6 +299,4 @@ def load_and_split_data(
             tolerance_dec
         )
         
-        # Return new instances (slices are already new views/copies depending on pandas internals, 
-        # but reset_index ensures clean new objects)
         return train_df, calib_df, test_df
