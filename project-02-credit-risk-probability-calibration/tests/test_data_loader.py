@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import decimal
 import os
-import random
 import sys
+import random
 import tempfile
-from pathlib import Path
 from typing import List, Tuple
 
 import pandas as pd
 import pytest
+from pathlib import Path
 
 
 project_root = Path(__file__).parent.parent
@@ -33,7 +33,6 @@ from src.data_loader import (
     _validate_stratification,
     load_and_split_data,
 )
-
 
 
 # -----------------------------------------------------------------------------
@@ -160,12 +159,6 @@ class TestSplittingLogic:
         t1, _, _ = _stratified_split(df, "target", seed=42)
         t2, _, _ = _stratified_split(df, "target", seed=99)
         
-        # With true stratified split + sort, data might look similar if uniform, 
-        # but the internal shuffle seed affects row order before sort. 
-        # Since we sort at the end, different seeds might actually result in identical 
-        # sorted outputs if the input is uniform. 
-        # To strictly test non-determinism, we rely on the fact that the test above 
-        # proves determinism for same seed.
         pass 
 
     def test_split_too_small(self) -> None:
@@ -181,10 +174,11 @@ class TestSplittingLogic:
 
 class TestLoadAndSplitData:
     def test_end_to_end_success(self) -> None:
+        # Generate data with 'target' column
         data = _generate_balanced_data(1000)
         path = _create_temp_csv(data)
         try:
-            # Uses default tolerance of 0.02
+            # Explicitly pass target_col because default is now 'default' per config.py
             train, calib, test = load_and_split_data(path, target_col="target")
             
             assert isinstance(train, pd.DataFrame)
@@ -225,10 +219,13 @@ class TestLoadAndSplitData:
         path = _create_temp_csv(data)
         try:
             try:
-                load_and_split_data(path, stratification_tolerance="0.001")
+                # FIX: Explicitly pass target_col="target" to match the test data schema
+                load_and_split_data(path, target_col="target", stratification_tolerance="0.001")
             except SplitValidationError:
                 pass 
             except ResourceManagementError:
                 pytest.fail("Should have raised SplitValidationError, not ResourceManagementError")
+            except DataValidationError as e:
+                pytest.fail(f"Should have raised SplitValidationError, not DataValidationError: {e}")
         finally:
             os.remove(path)
