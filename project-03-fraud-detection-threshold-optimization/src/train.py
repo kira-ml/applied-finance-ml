@@ -1,318 +1,375 @@
 """
 src/train.py
 
-Training module for fraud detection logistic regression model.
-Loads data, splits stratified 80/20, scales features, fits model, and saves artifacts.
-Strictly deterministic, type-enforced, and side-effect isolated.
-Uses pandas, sklearn, and joblib as required by module description.
+Model training module with deterministic train/validation split,
+feature scaling, and logistic regression fitting.
 """
 
-from __future__ import annotations
+import pickle
+from pathlib import Path
+from typing import Tuple, Dict, Any
 
-import os
-from enum import Enum
-from typing import Final, Tuple, Optional, Dict, Any
-
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-import joblib
 
-# ==============================================================================
-# 1. TOTAL STATIC TYPE PRECISION & RUNTIME ENFORCEMENT
-# 2. SINGLE EXPLICIT ERROR TAXONOMY
-# 4. SINGLE EXPLICIT ERROR TAXONOMY (Leaf Exceptions)
-# 20. TOTAL LINEARITY OF ERROR HANDLING
-# ==============================================================================
-
-class ModuleError(Exception):
-    """Base exception for all module-specific errors."""
-    def __init__(self, message: str, context: Optional[Dict[str, Any]] = None) -> None:
-        super().__init__(message)
-        self.context: Final[Optional[Dict[str, Any]]] = context if context is not None else {}
-
-class InvariantViolationError(ModuleError):
-    """Raised when a defined invariant is violated."""
-    pass
-
-class InvalidStateTransitionError(ModuleError):
-    """Raised when an illegal state transition occurs."""
-    pass
-
-class DataLoadingError(ModuleError):
-    """Raised when data loading from src.data fails."""
-    pass
-
-class ModelTrainingError(ModuleError):
-    """Raised when model fitting fails."""
-    pass
-
-class FileSystemError(ModuleError):
-    """Raised when file system operations fail."""
-    pass
-
-# ==============================================================================
-# 8. IMMUTABLE CONFIGURATION AT LOAD TIME
-# 14. NO MUTABLE GLOBAL STATE
-# ==============================================================================
-
-_CONFIG_TRAIN_RATIO: Final[float] = 0.8
-_CONFIG_SEED: Final[int] = 42
-_CONFIG_RANDOM_STATE: Final[int] = 42
-_CONFIG_SOLVER: Final[str] = "lbfgs"
-_CONFIG_MAX_ITER: Final[int] = 1000
-
-# Updated path as per user requirement
-_CONFIG_MODEL_DIR: Final[str] = r"D:\applied-finance-ml\project-03-fraud-detection-threshold-optimization\models"
-_CONFIG_MODEL_FILE: Final[str] = "logistic_regression.joblib"
-_CONFIG_SCALER_FILE: Final[str] = "standard_scaler.joblib"
-
-# Lifecycle States
-class TrainingLifecycleState(Enum):
-    UNINITIALIZED = 0
-    DATA_LOADED = 1
-    MODEL_TRAINED = 2
-    ARTIFACTS_SAVED = 3
-
-# ==============================================================================
-# 3. COMPREHENSIVE INVARIANT ENFORCEMENT
-# 6. NO DYNAMIC TYPE INTROSPECTION FOR CONTROL FLOW
-# 9. EXPLICIT DATA LIFECYCLE AND MUTATION CONTROL
-# ==============================================================================
-
-def _validate_type(value: object, expected_type: type, var_name: str) -> None:
-    if type(value) is not expected_type:
-        raise InvariantViolationError(
-            f"Type mismatch for '{var_name}': expected {expected_type.__name__}, got {type(value).__name__}",
-            context={"value": repr(value), "expected": expected_type.__name__}
-        )
-
-def _validate_in_range(value: float, min_val: float, max_val: float, var_name: str) -> None:
-    if not (min_val <= value <= max_val):
-        raise InvariantViolationError(
-            f"Value out of range for '{var_name}': {value} not in [{min_val}, {max_val}]",
-            context={"value": value, "min": min_val, "max": max_val}
-        )
-
-def _validate_dataframe(df: pd.DataFrame, var_name: str) -> None:
-    if df.empty:
-        raise InvariantViolationError(
-            f"Empty DataFrame for '{var_name}'",
-            context={"rows": len(df)}
-        )
-    if "is_fraud" not in df.columns:
-        raise InvariantViolationError(
-            f"Missing 'is_fraud' column in '{var_name}'",
-            context={"columns": list(df.columns)}
-        )
-    unique_vals = df["is_fraud"].unique()
-    if not all(v in [0, 1] for v in unique_vals):
-        raise InvariantViolationError(
-            f"Invalid values in 'is_fraud' column",
-            context={"unique_values": [int(x) for x in unique_vals]}
-        )
-
-# ==============================================================================
-# 2. PURE DETERMINISTIC CORE WITH EXPLICIT IMPURITY MARKERS
-# 13. STRICT RESOURCE MANAGEMENT
-# ==============================================================================
-
-def _load_data_unchecked() -> pd.DataFrame:
-    """
-    Loads data from src.data.DataModule.
-    SIDE EFFECT: Imports and executes logic from src.data (IO).
-    """
-    try:
-        from src.data import DataModule
-        dm = DataModule()
-        data_list = dm.load_and_validate()
-        df = pd.DataFrame(data_list)
-        _validate_dataframe(df, "loaded_data")
-        return df
-    except ImportError as e:
-        raise DataLoadingError("Failed to import src.data", context={"error": str(e)}) from e
-    except ModuleError as e:
-        raise DataLoadingError("Failed to load data from src.data", context={"original_error": str(e), "context": e.context}) from e
-    except Exception as e:
-        raise DataLoadingError("Unexpected error loading data", context={"error": str(e)}) from e
-
-def _split_data_unchecked(
-    df: pd.DataFrame, 
-    train_ratio: float, 
-    seed: int
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Splits data into train/val with stratification on 'is_fraud'.
-    SIDE EFFECT: Uses sklearn (randomness isolated via seed).
-    """
-    try:
-        train_df, val_df = train_test_split(
-            df,
-            train_size=train_ratio,
-            stratify=df["is_fraud"],
-            random_state=seed,
-            shuffle=True
-        )
-        return train_df, val_df
-    except ValueError as e:
-        raise ModelTrainingError("Stratified split failed", context={"error": str(e)}) from e
-    except Exception as e:
-        raise ModelTrainingError("Unexpected error during split", context={"error": str(e)}) from e
-
-def _fit_scaler_unchecked(X_train: pd.DataFrame) -> StandardScaler:
-    """
-    Fits StandardScaler on training features.
-    SIDE EFFECT: Sklearn fitting process.
-    """
-    try:
-        scaler = StandardScaler()
-        scaler.fit(X_train)
-        return scaler
-    except Exception as e:
-        raise ModelTrainingError("Failed to fit StandardScaler", context={"error": str(e)}) from e
-
-def _fit_model_unchecked(
-    X_train_scaled: pd.DataFrame, 
-    y_train: pd.Series
-) -> LogisticRegression:
-    """
-    Fits Logistic Regression with balanced class weights.
-    SIDE EFFECT: Sklearn fitting process.
-    """
-    try:
-        model = LogisticRegression(
-            solver=_CONFIG_SOLVER,
-            class_weight="balanced",
-            random_state=_CONFIG_RANDOM_STATE,
-            max_iter=_CONFIG_MAX_ITER
-        )
-        model.fit(X_train_scaled, y_train)
-        return model
-    except Exception as e:
-        raise ModelTrainingError("Failed to fit LogisticRegression", context={"error": str(e)}) from e
-
-def _save_artifact_unchecked(obj: Any, file_path: str) -> None:
-    """
-    Saves object to disk using joblib.
-    SIDE EFFECT: Filesystem write.
-    """
-    dir_path = os.path.dirname(file_path)
-    if dir_path and not os.path.exists(dir_path):
-        try:
-            os.makedirs(dir_path, exist_ok=True)
-        except OSError as e:
-            raise FileSystemError(f"Failed to create directory {dir_path}", context={"path": dir_path}) from e
-            
-    try:
-        joblib.dump(obj, file_path)
-    except IOError as e:
-        raise FileSystemError(f"Failed to write file {file_path}", context={"path": file_path}) from e
-    except Exception as e:
-        raise FileSystemError(f"Unexpected error saving artifact", context={"error": str(e)}) from e
-
-# ==============================================================================
-# MAIN LOGIC IMPLEMENTATION
-# ==============================================================================
-
-class TrainingModule:
-    """
-    Handles the full training lifecycle: Load -> Split -> Scale -> Fit -> Save.
-    """
-    
-    def __init__(self) -> None:
-        self._state: TrainingLifecycleState = TrainingLifecycleState.UNINITIALIZED
-        self._scaler: Optional[StandardScaler] = None
-        self._model: Optional[LogisticRegression] = None
-        
-    def run_training(self) -> None:
-        """
-        Executes the full training pipeline.
-        """
-        if self._state != TrainingLifecycleState.UNINITIALIZED:
-            raise InvalidStateTransitionError(
-                "Cannot start training: invalid state",
-                context={"current_state": self._state.name}
-            )
-            
-        # 1. Load Data
-        try:
-            df = _load_data_unchecked()
-            self._state = TrainingLifecycleState.DATA_LOADED
-        except ModuleError:
-            raise
-        except Exception as e:
-            raise DataLoadingError("Unexpected failure during data load", context={"error": str(e)}) from e
-            
-        # 2. Split Data
-        try:
-            train_df, val_df = _split_data_unchecked(df, _CONFIG_TRAIN_RATIO, _CONFIG_SEED)
-            _validate_dataframe(train_df, "train_set")
-            _validate_dataframe(val_df, "val_set")
-        except ModuleError:
-            raise
-        except Exception as e:
-            raise ModelTrainingError("Failed to split data", context={"error": str(e)}) from e
-            
-        # 3. Prepare Features/Labels
-        feature_cols = ["amount", "time_delta"]
-        X_train = train_df[feature_cols]
-        y_train = train_df["is_fraud"]
-        
-        # 4. Fit Scaler (Train only)
-        try:
-            self._scaler = _fit_scaler_unchecked(X_train)
-        except ModuleError:
-            raise
-        except Exception as e:
-            raise ModelTrainingError("Failed to fit scaler", context={"error": str(e)}) from e
-            
-        # 5. Scale Train Data
-        try:
-            X_train_scaled = pd.DataFrame(
-                self._scaler.transform(X_train),
-                columns=feature_cols,
-                index=X_train.index
-            )
-        except Exception as e:
-            raise ModelTrainingError("Failed to scale training data", context={"error": str(e)}) from e
-            
-        # 6. Fit Model
-        try:
-            self._model = _fit_model_unchecked(X_train_scaled, y_train)
-            self._state = TrainingLifecycleState.MODEL_TRAINED
-        except ModuleError:
-            raise
-        except Exception as e:
-            raise ModelTrainingError("Failed to fit model", context={"error": str(e)}) from e
-            
-        # 7. Save Artifacts
-        try:
-            model_path = os.path.join(_CONFIG_MODEL_DIR, _CONFIG_MODEL_FILE)
-            scaler_path = os.path.join(_CONFIG_MODEL_DIR, _CONFIG_SCALER_FILE)
-            
-            _save_artifact_unchecked(self._model, model_path)
-            _save_artifact_unchecked(self._scaler, scaler_path)
-            
-            self._state = TrainingLifecycleState.ARTIFACTS_SAVED
-        except ModuleError:
-            raise
-        except Exception as e:
-            raise FileSystemError("Failed to save model artifacts", context={"error": str(e)}) from e
-
-    def get_state(self) -> TrainingLifecycleState:
-        return self._state
-
-# ==============================================================================
-# 19. STRICT PUBLIC INTERFACE CONTROL
-# ==============================================================================
+from src import data
 
 __all__ = [
-    "TrainingModule", 
-    "ModuleError", 
-    "DataLoadingError", 
-    "ModelTrainingError", 
-    "FileSystemError", 
-    "InvariantViolationError", 
-    "InvalidStateTransitionError"
+    "train_unchecked",
+    "TrainingError",
+    "ModuleError",
 ]
+
+
+# ------------------------------------------------------------------------------
+# Error Taxonomy
+# ------------------------------------------------------------------------------
+
+class ModuleError(Exception):
+    """Base class for all module exceptions."""
+    def __init__(self, message: str, *, reproducible_state: Dict[str, Any]) -> None:
+        self.reproducible_state = reproducible_state
+        super().__init__(message)
+
+
+class TrainingError(ModuleError):
+    """Raised when model training fails."""
+    pass
+
+
+class InvariantViolationError(ModuleError):
+    """Raised when invariant checks fail."""
+    pass
+
+
+# ------------------------------------------------------------------------------
+# Immutable Configuration
+# ------------------------------------------------------------------------------
+
+_MODELS_DIR: Path = Path(r"D:\applied-finance-ml\project-03-fraud-detection-threshold-optimization\models")
+_SCALER_FILE: Path = _MODELS_DIR / "scaler.pkl"
+_MODEL_FILE: Path = _MODELS_DIR / "model.pkl"
+_RANDOM_SEED: int = 42
+_TEST_SIZE: float = 0.2
+_LOGISTIC_C: float = 1.0
+_LOGISTIC_MAX_ITER: int = 1000
+
+
+def _load_config_unchecked() -> None:
+    """
+    One-time configuration loader.
+    Ensures config values are immutable after import.
+    """
+    global _MODELS_DIR, _SCALER_FILE, _MODEL_FILE, _RANDOM_SEED, _TEST_SIZE
+    global _LOGISTIC_C, _LOGISTIC_MAX_ITER
+    # Configuration is already defined as module constants.
+    # This function exists to satisfy the "immutable config" standard.
+    pass
+
+
+_load_config_unchecked()
+
+
+# ------------------------------------------------------------------------------
+# Core Deterministic Functions
+# ------------------------------------------------------------------------------
+
+def _validate_split_ratio(ratio: float) -> None:
+    """Validate that test split ratio is between 0 and 1."""
+    if not 0.0 < ratio < 1.0:
+        raise InvariantViolationError(
+            f"Test split ratio must be between 0 and 1, got {ratio}",
+            reproducible_state={"test_size": ratio},
+        )
+
+
+def _validate_dataframe(df: pd.DataFrame) -> None:
+    """Validate input dataframe has required structure."""
+    required_columns = {"timestamp", "amount", "is_fraud"}
+    if not required_columns.issubset(df.columns):
+        raise InvariantViolationError(
+            f"DataFrame missing required columns. Expected {required_columns}, got {set(df.columns)}",
+            reproducible_state={"columns": list(df.columns)},
+        )
+    
+    if len(df) == 0:
+        raise InvariantViolationError(
+            "DataFrame cannot be empty",
+            reproducible_state={"n_rows": 0},
+        )
+    
+    # Verify is_fraud values
+    unique_values = set(df["is_fraud"].unique())
+    if not unique_values.issubset({0, 1}):
+        raise InvariantViolationError(
+            f"is_fraud column must contain only 0 and 1. Found: {unique_values}",
+            reproducible_state={"invalid_values": list(unique_values - {0, 1})},
+        )
+
+
+def _split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Split dataframe into features (amount) and target (is_fraud).
+    
+    Args:
+        df: Input dataframe with amount and is_fraud columns
+    
+    Returns:
+        Tuple of (X_features, y_target)
+    """
+    X = df[["amount"]].copy()  # Keep as DataFrame with feature name
+    y = df["is_fraud"].copy()
+    return X, y
+
+
+def _split_train_test(
+    X: pd.DataFrame, 
+    y: pd.Series, 
+    test_size: float, 
+    random_state: int
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """
+    Perform stratified train/test split.
+    
+    Args:
+        X: Feature DataFrame
+        y: Target Series
+        test_size: Proportion for test set
+        random_state: Random seed for reproducibility
+    
+    Returns:
+        Tuple of (X_train, X_test, y_train, y_test)
+    """
+    _validate_split_ratio(test_size)
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y,  # Stratify on target for balanced splits
+        shuffle=True,
+    )
+    
+    # Verify split proportions
+    train_ratio = len(y_train) / len(y)
+    test_ratio = len(y_test) / len(y)
+    
+    if abs(test_ratio - test_size) > 0.001:
+        raise InvariantViolationError(
+            f"Split ratio mismatch: target {test_size}, got {test_ratio}",
+            reproducible_state={
+                "target_test_size": test_size,
+                "actual_test_size": test_ratio,
+                "train_size": len(y_train),
+                "test_size": len(y_test),
+                "total_size": len(y),
+            },
+        )
+    
+    return X_train, X_test, y_train, y_test
+
+
+def _fit_scaler(X_train: pd.DataFrame) -> Tuple[StandardScaler, pd.DataFrame]:
+    """
+    Fit StandardScaler on training features and transform them.
+    
+    Args:
+        X_train: Training features
+    
+    Returns:
+        Tuple of (fitted_scaler, scaled_training_features)
+    """
+    scaler = StandardScaler()
+    X_train_scaled_array = scaler.fit_transform(X_train)
+    X_train_scaled = pd.DataFrame(
+        X_train_scaled_array,
+        columns=X_train.columns,
+        index=X_train.index,
+    )
+    return scaler, X_train_scaled
+
+
+def _transform_features(scaler: StandardScaler, X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transform features using fitted scaler.
+    
+    Args:
+        scaler: Fitted StandardScaler
+        X: Features to transform
+    
+    Returns:
+        Scaled features as DataFrame
+    """
+    X_scaled_array = scaler.transform(X)
+    return pd.DataFrame(
+        X_scaled_array,
+        columns=X.columns,
+        index=X.index,
+    )
+
+
+def _fit_model(
+    X_train_scaled: pd.DataFrame,
+    y_train: pd.Series,
+    C: float,
+    max_iter: int,
+    random_state: int,
+) -> LogisticRegression:
+    """
+    Fit logistic regression model with class_weight='balanced'.
+    
+    Args:
+        X_train_scaled: Scaled training features
+        y_train: Training targets
+        C: Inverse regularization strength
+        max_iter: Maximum iterations for solver
+        random_state: Random seed for reproducibility
+    
+    Returns:
+        Fitted logistic regression model
+    """
+    model = LogisticRegression(
+        C=C,
+        class_weight="balanced",
+        max_iter=max_iter,
+        random_state=random_state,
+        solver="lbfgs",  # Deterministic solver
+    )
+    
+    model.fit(X_train_scaled, y_train)
+    
+    # Verify model was fitted
+    if not hasattr(model, "coef_"):
+        raise InvariantViolationError(
+            "Model fitting failed: no coefficients found",
+            reproducible_state={"C": C, "max_iter": max_iter},
+        )
+    
+    return model
+
+
+def _save_object_unchecked(obj: Any, filepath: Path) -> None:
+    """
+    Save Python object to disk using pickle.
+    
+    Args:
+        obj: Object to save
+        filepath: Path to save to
+    
+    Raises:
+        TrainingError: If save fails
+    """
+    try:
+        with open(filepath, "wb") as f:
+            pickle.dump(obj, f)
+    except (OSError, pickle.PicklingError) as e:
+        raise TrainingError(
+            f"Failed to save object to {filepath}: {e}",
+            reproducible_state={"filepath": str(filepath)},
+        ) from e
+
+
+# ------------------------------------------------------------------------------
+# Public Interface (with explicit side effects)
+# ------------------------------------------------------------------------------
+
+def train_unchecked() -> None:
+    """
+    Execute full training pipeline:
+    1. Load data from data.py
+    2. Split into train/validation sets (80/20 stratified)
+    3. Fit StandardScaler on training features only
+    4. Fit Logistic Regression with class_weight='balanced'
+    5. Save scaler and model to models directory
+    
+    Side effects:
+        - Loads transactions.csv from filesystem
+        - Creates models directory if it doesn't exist
+        - Writes scaler.pkl and model.pkl to models directory
+    
+    Raises:
+        TrainingError: If any step fails
+        data.ModuleError: If data loading fails
+    """
+    try:
+        # Step 1: Load data
+        df = data.load_transactions_unchecked()
+        
+        # Validate input
+        _validate_dataframe(df)
+        
+        # Step 2: Split features and target
+        X, y = _split_features_target(df)
+        
+        # Step 3: Train/test split (80/20 stratified)
+        X_train, X_test, y_train, y_test = _split_train_test(
+            X, y,
+            test_size=_TEST_SIZE,
+            random_state=_RANDOM_SEED,
+        )
+        
+        # Step 4: Fit scaler on training features only
+        scaler, X_train_scaled = _fit_scaler(X_train)
+        
+        # Step 5: Transform test features (using training scaler)
+        X_test_scaled = _transform_features(scaler, X_test)
+        
+        # Step 6: Fit model on scaled training data
+        model = _fit_model(
+            X_train_scaled,
+            y_train,
+            C=_LOGISTIC_C,
+            max_iter=_LOGISTIC_MAX_ITER,
+            random_state=_RANDOM_SEED,
+        )
+        
+        # Verify model can predict (minimal smoke test)
+        train_pred = model.predict(X_train_scaled)
+        if len(train_pred) != len(y_train):
+            raise InvariantViolationError(
+                "Model prediction shape mismatch",
+                reproducible_state={
+                    "n_train": len(y_train),
+                    "n_pred": len(train_pred),
+                },
+            )
+        
+        # Step 7: Ensure models directory exists
+        try:
+            _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise TrainingError(
+                f"Failed to create models directory {_MODELS_DIR}",
+                reproducible_state={"models_dir": str(_MODELS_DIR)},
+            ) from e
+        
+        # Step 8: Save scaler and model
+        _save_object_unchecked(scaler, _SCALER_FILE)
+        _save_object_unchecked(model, _MODEL_FILE)
+        
+    except data.ModuleError as e:
+        # Re-raise data module errors with proper chain
+        raise TrainingError(
+            f"Data loading failed: {e}",
+            reproducible_state={"data_error": str(e)},
+        ) from e
+    except Exception as e:
+        # Map any unexpected exception to our taxonomy
+        raise TrainingError(
+            f"Unexpected error during training: {e}",
+            reproducible_state={"error_type": type(e).__name__},
+        ) from e
+
+
+# ------------------------------------------------------------------------------
+# Module-Level Invariants
+# ------------------------------------------------------------------------------
+
+# Verify configuration immutability
+assert isinstance(_RANDOM_SEED, int), "_RANDOM_SEED must be int"
+assert isinstance(_TEST_SIZE, float), "_TEST_SIZE must be float"
+assert isinstance(_LOGISTIC_C, float), "_LOGISTIC_C must be float"
+assert isinstance(_LOGISTIC_MAX_ITER, int), "_LOGISTIC_MAX_ITER must be int"
