@@ -1,228 +1,314 @@
 """
-tests/test_data.py
+test_data.py
 
-Unit tests for src/data.py.
-Strictly minimal, deterministic, and dependent only on standard library.
-Auto-configures path to ensure 'src' is discoverable.
+Unit tests for src.data module.
+Minimal, deterministic testing with no over-engineering.
 """
 
-from __future__ import annotations
-
+import csv
 import os
-import sys
-import shutil
 import tempfile
-from typing import Final, List, Optional, Callable, Any
+from pathlib import Path
+from unittest import mock
 
-# ==============================================================================
-# PATH CONFIGURATION (CRITICAL FIX)
-# Automatically adds the project root to sys.path so 'import src' works.
-# Assumes structure: project_root/tests/test_data.py
-# ==============================================================================
+import numpy as np
+import pandas as pd
+import pytest
 
-_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
+from src import data
 
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+# ------------------------------------------------------------------------------
+# Test Fixtures
+# ------------------------------------------------------------------------------
 
-# ==============================================================================
-# IMPORTS (Now safe after path fix)
-# ==============================================================================
+@pytest.fixture
+def temp_data_dir():
+    """Provide temporary directory for test outputs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
 
-try:
-    from src.data import (
-        DataModule,
-        DataLifecycleState,
-        ModuleError,
-        DataValidationError,
-        DataGenerationError,
-        FileSystemError,
-        InvariantViolationError,
-        InvalidStateTransitionError,
-        _generate_synthetic_rows_unchecked,
-        _validate_type,
-        _validate_in_range,
-        _write_csv_unchecked,
-        _read_csv_unchecked
-    )
-except ImportError as e:
-    raise RuntimeError(f"Failed to import src.data. Ensure project structure is correct. Error: {e}")
 
-# ==============================================================================
-# TEST CONFIGURATION (Immutable)
-# ==============================================================================
+@pytest.fixture
+def patch_config_paths(temp_data_dir):
+    """Patch module-level paths to use temp directory."""
+    with mock.patch.object(data, "_DATA_DIR", temp_data_dir):
+        with mock.patch.object(data, "_DATA_FILE", temp_data_dir / "transactions.csv"):
+            yield
 
-_TEST_FRAUD_RATE: Final[float] = 0.01
-_TEST_ROW_COUNT: Final[int] = 100
-_TEST_SEED: Final[int] = 999
 
-# ==============================================================================
-# TEST RUNNER INFRASTRUCTURE (Minimal)
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Test Configuration and Invariants
+# ------------------------------------------------------------------------------
 
-class TestResult:
-    def __init__(self, name: str, passed: bool, error: Optional[str] = None) -> None:
-        self.name: Final[str] = name
-        self.passed: Final[bool] = passed
-        self.error: Final[Optional[str]] = error
+def test_config_values_are_correct_types():
+    """Verify configuration constants have correct types."""
+    assert isinstance(data._RANDOM_SEED, int)
+    assert isinstance(data._N_ROWS, int)
+    assert isinstance(data._FRAUD_RATIO, float)
 
-def run_test(name: str, func: Callable[[], None]) -> TestResult:
+
+def test_config_values_are_immutable():
+    """
+    Verify config values cannot be mutated after import.
+    Note: Python allows reassignment, but our module design treats them as immutable.
+    We verify they're not accidentally mutated during module execution.
+    """
+    original_seed = data._RANDOM_SEED
+    original_rows = data._N_ROWS
+    original_ratio = data._FRAUD_RATIO
+    
+    # Run module functions that might accidentally modify config
+    data._validate_fraction(0.5)
+    data._generate_fraud_labels(seed=42, n_rows=100, fraud_ratio=0.01)
+    data._generate_amounts(seed=42, n_rows=100)
+    data._generate_timestamps(seed=42, n_rows=100)
+    
+    # Verify values haven't changed
+    assert data._RANDOM_SEED == original_seed
+    assert data._N_ROWS == original_rows
+    assert data._FRAUD_RATIO == original_ratio
+
+
+# ------------------------------------------------------------------------------
+# Test Core Deterministic Functions
+# ------------------------------------------------------------------------------
+
+def test_validate_fraction_valid_values():
+    """Test fraction validation with valid inputs."""
+    # Should not raise
+    data._validate_fraction(0.0)
+    data._validate_fraction(0.5)
+    data._validate_fraction(1.0)
+
+
+def test_validate_fraction_invalid_values():
+    """Test fraction validation rejects invalid inputs."""
+    with pytest.raises(data.InvariantViolationError):
+        data._validate_fraction(-0.1)
+    with pytest.raises(data.InvariantViolationError):
+        data._validate_fraction(1.1)
+
+
+def test_generate_fraud_labels_exact_ratio():
+    """Test fraud label generation hits target ratio exactly."""
+    labels = data._generate_fraud_labels(seed=42, n_rows=10000, fraud_ratio=0.01)
+    
+    assert len(labels) == 10000
+    assert labels.dtype == np.int8
+    assert set(labels).issubset({0, 1})
+    
+    n_fraud = int(sum(labels))
+    assert n_fraud == 100  # 1% of 10000
+
+
+def test_generate_fraud_labels_reproducible():
+    """Test same seed produces identical labels."""
+    labels1 = data._generate_fraud_labels(seed=123, n_rows=100, fraud_ratio=0.1)
+    labels2 = data._generate_fraud_labels(seed=123, n_rows=100, fraud_ratio=0.1)
+    
+    np.testing.assert_array_equal(labels1, labels2)
+
+
+def test_generate_amounts_positive():
+    """Test amounts are positive and rounded to 2 decimals."""
+    amounts = data._generate_amounts(seed=42, n_rows=1000)
+    
+    assert len(amounts) == 1000
+    assert (amounts > 0).all()
+    # Check 2 decimal places (allowing for floating point)
+    assert (np.abs(amounts * 100 - np.round(amounts * 100)) < 1e-10).all()
+
+
+def test_generate_amounts_reproducible():
+    """Test same seed produces identical amounts."""
+    amounts1 = data._generate_amounts(seed=42, n_rows=100)
+    amounts2 = data._generate_amounts(seed=42, n_rows=100)
+    
+    np.testing.assert_array_equal(amounts1, amounts2)
+
+
+def test_generate_timestamps_format():
+    """Test timestamps are valid datetime strings."""
+    timestamps = data._generate_timestamps(seed=42, n_rows=100)
+    
+    assert len(timestamps) == 100
+    # Verify format: YYYY-MM-DD HH:MM:SS
+    for ts in timestamps:
+        pd.to_datetime(ts)  # Will raise if invalid
+
+
+def test_generate_timestamps_range():
+    """Test timestamps are within 30-day window."""
+    timestamps = data._generate_timestamps(seed=42, n_rows=1000)
+    ts_series = pd.to_datetime(timestamps)
+    
+    min_ts = pd.Timestamp("2024-01-01")
+    max_ts = pd.Timestamp("2024-01-31")
+    
+    assert (ts_series >= min_ts).all()
+    assert (ts_series <= max_ts).all()
+
+
+def test_generate_transactions_core_invariant_enforcement():
+    """Test core generation enforces fraud ratio invariant."""
+    # Should pass
+    data._generate_transactions_core(seed=42, n_rows=1000, fraud_ratio=0.01)
+    
+    # Should fail with invalid fraction
+    with pytest.raises(data.InvariantViolationError):
+        data._generate_transactions_core(seed=42, n_rows=1000, fraud_ratio=1.5)
+
+
+# ------------------------------------------------------------------------------
+# Test Public Interface (Side Effects)
+# ------------------------------------------------------------------------------
+
+def test_generate_transactions_unchecked_creates_file(patch_config_paths, temp_data_dir):
+    """Test generation creates CSV file with correct structure."""
+    data.generate_transactions_unchecked()
+    
+    assert (temp_data_dir / "transactions.csv").exists()
+    
+    # Read and verify content
+    df = pd.read_csv(temp_data_dir / "transactions.csv")
+    assert list(df.columns) == ["timestamp", "amount", "is_fraud"]
+    assert len(df) == 10000
+    
+    # Verify fraud ratio
+    fraud_ratio = df["is_fraud"].mean()
+    assert abs(fraud_ratio - 0.01) < 0.001
+
+
+def test_generate_transactions_unchecked_directory_creation(temp_data_dir):
+    """Test generation creates directory if it doesn't exist."""
+    new_dir = temp_data_dir / "nested" / "path"
+    
+    with mock.patch.object(data, "_DATA_DIR", new_dir):
+        with mock.patch.object(data, "_DATA_FILE", new_dir / "transactions.csv"):
+            data.generate_transactions_unchecked()
+    
+    assert new_dir.exists()
+    assert (new_dir / "transactions.csv").exists()
+
+
+def test_generate_transactions_unchecked_file_write_error():
+    """Test proper error wrapping for write failures."""
+    with mock.patch("builtins.open", side_effect=OSError("Permission denied")):
+        with pytest.raises(data.DataGenerationError) as excinfo:
+            data.generate_transactions_unchecked()
+        
+        assert "Failed to generate transactions" in str(excinfo.value)
+        assert "reproducible_state" in dir(excinfo.value)
+
+
+def test_load_transactions_unchecked_success(patch_config_paths, temp_data_dir):
+    """Test successful loading of valid CSV."""
+    # First generate data
+    data.generate_transactions_unchecked()
+    
+    # Then load it
+    df = data.load_transactions_unchecked()
+    
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) == 10000
+    assert list(df.columns) == ["timestamp", "amount", "is_fraud"]
+
+
+def test_load_transactions_unchecked_file_not_found():
+    """Test error when file doesn't exist."""
+    with mock.patch.object(data, "_DATA_FILE", Path("/nonexistent/path.csv")):
+        with pytest.raises(data.DataLoadingError):
+            data.load_transactions_unchecked()
+
+
+def test_load_transactions_unchecked_missing_columns(patch_config_paths, temp_data_dir):
+    """Test validation catches missing columns."""
+    # Create invalid CSV
+    with open(temp_data_dir / "transactions.csv", "w") as f:
+        f.write("wrong_col1,wrong_col2\n1,2")
+    
+    with pytest.raises(data.DataValidationError) as excinfo:
+        data.load_transactions_unchecked()
+    
+    assert "Missing required columns" in str(excinfo.value)
+
+
+def test_load_transactions_unchecked_invalid_fraud_values(patch_config_paths, temp_data_dir):
+    """Test validation catches invalid is_fraud values."""
+    # Create CSV with invalid fraud values
+    with open(temp_data_dir / "transactions.csv", "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "amount", "is_fraud"])
+        writer.writerow(["2024-01-01", 100.0, 2])  # 2 is invalid
+    
+    with pytest.raises(data.DataValidationError) as excinfo:
+        data.load_transactions_unchecked()
+    
+    assert "is_fraud column must contain only 0 and 1" in str(excinfo.value)
+
+
+def test_load_transactions_unchecked_row_count_invariant(patch_config_paths, temp_data_dir):
+    """Test invariant check for row count."""
+    # Create CSV with wrong number of rows
+    with open(temp_data_dir / "transactions.csv", "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "amount", "is_fraud"])
+        for i in range(500):  # Only 500 rows instead of 10000
+            writer.writerow(["2024-01-01", 100.0, 0])
+    
+    with pytest.raises(data.InvariantViolationError) as excinfo:
+        data.load_transactions_unchecked()
+    
+    assert "Expected 10000 rows" in str(excinfo.value)
+
+
+# ------------------------------------------------------------------------------
+# Test Error Taxonomy and Exception Chains
+# ------------------------------------------------------------------------------
+
+def test_all_exceptions_inherit_from_module_error():
+    """Verify all custom exceptions inherit from ModuleError."""
+    assert issubclass(data.DataGenerationError, data.ModuleError)
+    assert issubclass(data.DataLoadingError, data.ModuleError)
+    assert issubclass(data.DataValidationError, data.ModuleError)
+    assert issubclass(data.InvariantViolationError, data.ModuleError)
+
+
+def test_exceptions_store_reproducible_state():
+    """Test exceptions capture state for reproducibility."""
     try:
-        func()
-        return TestResult(name, True)
-    except AssertionError as e:
-        return TestResult(name, False, f"AssertionFailed: {str(e)}")
-    except Exception as e:
-        return TestResult(name, False, f"UnexpectedError: {type(e).__name__}: {str(e)}")
+        raise data.DataGenerationError("test", reproducible_state={"key": "value"})
+    except data.DataGenerationError as e:
+        assert e.reproducible_state == {"key": "value"}
 
-def main() -> int:
-    results: List[TestResult] = []
-    
-    tests = [
-        ("test_generate_determinism", test_generate_determinism),
-        ("test_generate_fraud_ratio", test_generate_fraud_ratio),
-        ("test_full_lifecycle", test_full_lifecycle),
-        ("test_invalid_state_transition", test_invalid_state_transition),
-        ("test_validate_fraud_values", test_validate_fraud_values),
-        ("test_type_validation", test_type_validation),
-    ]
-    
-    print(f"Running tests from: {_PROJECT_ROOT}")
-    print("-" * 50)
-    
-    for name, func in tests:
-        results.append(run_test(name, func))
-        
-    passed_count = sum(1 for r in results if r.passed)
-    total_count = len(results)
-    
-    print("-" * 50)
-    print(f"Test Results: {passed_count}/{total_count} passed")
-    
-    for res in results:
-        status = "PASS" if res.passed else "FAIL"
-        color_code = "\033[92m" if res.passed else "\033[91m" # Green/Red if terminal supports it
-        reset_code = "\033[0m"
-        print(f"[{color_code}{status}{reset_code}] {res.name}")
-        if not res.passed and res.error:
-            print(f"       -> {res.error}")
-            
-    return 0 if passed_count == total_count else 1
 
-# ==============================================================================
-# TEST CASES
-# ==============================================================================
+def test_generate_transactions_unchecked_preserves_cause():
+    """Test exception chaining preserves original error."""
+    with mock.patch("builtins.open", side_effect=OSError("Disk full")):
+        with pytest.raises(data.DataGenerationError) as excinfo:
+            data.generate_transactions_unchecked()
+        
+        assert isinstance(excinfo.value.__cause__, OSError)
 
-def test_generate_determinism() -> None:
-    """Verify same seed produces identical data."""
-    rows_1 = _generate_synthetic_rows_unchecked(_TEST_ROW_COUNT, _TEST_FRAUD_RATE, _TEST_SEED)
-    rows_2 = _generate_synthetic_rows_unchecked(_TEST_ROW_COUNT, _TEST_FRAUD_RATE, _TEST_SEED)
-    
-    assert len(rows_1) == len(rows_2), "Row counts mismatch"
-    for i, (r1, r2) in enumerate(zip(rows_1, rows_2)):
-        assert r1 == r2, f"Row {i} differs between runs"
 
-def test_generate_fraud_ratio() -> None:
-    """Verify exactly 1% fraud rate."""
-    rows = _generate_synthetic_rows_unchecked(_TEST_ROW_COUNT, _TEST_FRAUD_RATE, _TEST_SEED)
-    fraud_count = sum(1 for r in rows if r[3] == 1)
-    expected_fraud = int(_TEST_ROW_COUNT * _TEST_FRAUD_RATE)
-    
-    assert fraud_count == expected_fraud, f"Expected {expected_fraud} fraud cases, got {fraud_count}"
+# ------------------------------------------------------------------------------
+# Test Module Interface
+# ------------------------------------------------------------------------------
 
-def test_full_lifecycle() -> None:
-    """Test generate -> save -> load -> validate flow using temp directory."""
-    temp_dir = tempfile.mkdtemp()
-    test_file = os.path.join(temp_dir, "test_trans.csv")
-    
-    try:
-        # 1. Generate
-        rows = _generate_synthetic_rows_unchecked(100, 0.01, 42)
-        
-        # 2. Write (using helper directly to bypass hardcoded D:\ path)
-        _write_csv_unchecked(test_file, rows)
-        
-        assert os.path.exists(test_file), "File was not created"
-        
-        # 3. Read
-        raw = _read_csv_unchecked(test_file)
-        assert len(raw) == 101, f"Header + 100 rows expected, got {len(raw)}"
-        
-        # 4. Validate Logic
-        header = raw[0]
-        assert header == ["transaction_id", "amount", "time_delta", "is_fraud"], "Header mismatch"
-        
-        fraud_vals = [int(r[3]) for r in raw[1:]]
-        assert all(v in (0, 1) for v in fraud_vals), "Invalid fraud values found"
-        
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+def test_module_exports_expected_names():
+    """Test __all__ contains expected public symbols."""
+    expected = {
+        "generate_transactions_unchecked",
+        "load_transactions_unchecked",
+        "DataGenerationError",
+        "DataLoadingError",
+        "DataValidationError",
+        "ModuleError",
+    }
+    assert set(data.__all__) == expected
 
-def test_invalid_state_transition() -> None:
-    """Verify state machine enforcement."""
-    dm = DataModule()
-    
-    # Try to load before generate
-    try:
-        dm.load_and_validate()
-        assert False, "Expected InvalidStateTransitionError"
-    except InvalidStateTransitionError:
-        pass # Expected
-        
-    # Simulate state change to test transition logic without needing real file
-    dm._state = DataLifecycleState.GENERATED
-    
-    # Now load should attempt to read. Since file doesn't exist at D:\..., 
-    # it should raise FileSystemError, NOT InvalidStateTransitionError.
-    try:
-        dm.load_and_validate()
-    except FileSystemError:
-        pass # Expected (file missing), but state transition was valid
-    except InvalidStateTransitionError:
-        assert False, "State transition should have been allowed"
-    except Exception:
-        pass # Other errors acceptable for this specific transition test
 
-def test_validate_fraud_values() -> None:
-    """Verify rejection of invalid fraud labels."""
-    temp_dir = tempfile.mkdtemp()
-    test_file = os.path.join(temp_dir, "bad.csv")
-    
-    try:
-        with open(test_file, 'w', newline='', encoding='utf-8') as f:
-            f.write("transaction_id,amount,time_delta,is_fraud\n")
-            f.write("1,10.5,100.0,2\n") # Invalid: 2
-            
-        raw = _read_csv_unchecked(test_file)
-        
-        # Manually trigger validation logic
-        row = raw[1]
-        is_fraud = int(row[3])
-        if is_fraud not in (0, 1):
-            raise DataValidationError("Invalid value", context={"value": is_fraud})
-            
-    except DataValidationError:
-        pass # Expected
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-
-def test_type_validation() -> None:
-    """Verify runtime type checks."""
-    try:
-        _validate_type("string", int, "test_var")
-        assert False, "Expected InvariantViolationError"
-    except InvariantViolationError:
-        pass
-        
-    try:
-        _validate_in_range(1.5, 0.0, 1.0, "test_ratio")
-        assert False, "Expected InvariantViolationError"
-    except InvariantViolationError:
-        pass
-
-if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+def test_private_members_not_exported():
+    """Test private members are not in __all__."""
+    for name in data.__all__:
+        assert not name.startswith("_")
