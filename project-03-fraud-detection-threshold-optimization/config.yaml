@@ -1,0 +1,117 @@
+# config.yaml
+# Optimized for: Fraud Detection Threshold Optimization (Project 3)
+# Environment: Intel Core i5, CPU-only, Limited RAM
+# Objective: Maximize F2-Score / Minimize Cost on Imbalanced Data (1% Fraud)
+
+# -----------------------------------------------------------------------------
+# 1. Reproducibility & Execution Control
+# -----------------------------------------------------------------------------
+# Fixed seeds ensure bitwise identical results across runs on the same hardware.
+seed: 42
+deterministic_mode: true  # Forces sklearn/numpy to use single-threaded deterministic algos where possible
+
+# -----------------------------------------------------------------------------
+# 2. Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  raw_path: "data/raw/transactions.csv"
+  target_column: "is_fraud"
+  
+  # Memory Optimization for Limited RAM
+  # Downcasting types during ingestion to save ~50% memory vs defaults
+  dtype_overrides:
+    numeric: "float32" 
+    categorical: "category"
+    
+  # Integrity Checks
+  validation:
+    min_fraud_rate: 0.005  # Warn if fraud < 0.5% (expected ~1%)
+    max_null_ratio_target: 0.0 # Target column must be 100% complete
+
+# -----------------------------------------------------------------------------
+# 3. Preprocessing & Splitting Strategy
+# -----------------------------------------------------------------------------
+preprocessing:
+  # Stratified split is MANDATORY for 1% fraud rate to ensure minority class 
+  # exists in Train, Validation, and Test sets.
+  split_ratios:
+    train: 0.70
+    val: 0.15   # Dedicated strictly for threshold tuning
+    test: 0.15  # Dedicated strictly for final evaluation
+  
+  imputation:
+    numeric_strategy: "median" # Robust to outliers common in financial data
+    categorical_strategy: "most_frequent"
+    
+  scaling:
+    method: "standard" # Required for Logistic Regression convergence
+    with_mean: true
+    with_std: true
+
+# -----------------------------------------------------------------------------
+# 4. Model Selection & Training Logic
+# -----------------------------------------------------------------------------
+model:
+  # Primary Choice: Logistic Regression
+  # Reason: Low RAM footprint, fast CPU inference, probability outputs are well-calibrated.
+  type: "logistic_regression"
+  
+  logistic_regression:
+    solver: "liblinear"      # Optimized for small-to-medium datasets on CPU
+    penalty: "l2"
+    C: 1.0                   # Inverse regularization strength
+    max_iter: 1000           # Ensure convergence despite imbalance
+    class_weight: "balanced" # CRITICAL: Auto-adjusts weights inversely to class frequency
+    
+  # Alternative: Random Forest (Uncomment to switch)
+  # type: "random_forest"
+  # random_forest:
+  #   n_estimators: 50       # Keep low for CPU/RAM efficiency
+  #   max_depth: 6           # Prevent overfitting and excessive memory use
+  #   class_weight: "balanced_subsample"
+  #   n_jobs: -1             # Use all available CPU cores
+
+# -----------------------------------------------------------------------------
+# 5. Threshold Optimization (Core Business Logic)
+# -----------------------------------------------------------------------------
+# This section defines the "Cost Matrix" and optimization objective.
+# Standard 0.5 threshold is IGNORED. The system will sweep 0.01-0.99.
+
+optimization:
+  # Objective Function: 
+  # 'f2_score': Prioritizes Recall (catching fraud) over Precision. 
+  #             Beta=2 means Recall is twice as important as Precision.
+  # 'min_cost': Uses the explicit cost matrix below to find lowest monetary loss.
+  objective_metric: "f2_score" 
+  
+  # Cost Matrix (Business Context)
+  # These values drive the 'min_cost' logic if selected, or inform F2 weighting.
+  costs:
+    false_negative: 100.0   # Cost of missing a fraud transaction (High!)
+    false_positive: 1.0     # Cost of flagging a legitimate user (Low annoyance)
+    
+  # Search Space
+  threshold_search:
+    start: 0.01
+    end: 0.99
+    step: 0.01
+  
+  # Success Criteria
+  success_thresholds:
+    min_pr_auc: 0.40        # Project requirement: PR-AUC > 0.40
+    min_recall_at_optimal: 0.60 # Expectation: Catch at least 60% of fraud
+
+# -----------------------------------------------------------------------------
+# 6. Artifacts & Logging
+# -----------------------------------------------------------------------------
+output:
+  base_dir: "runs"
+  save_predictions: true    # Save prob scores for manual audit
+  verbose_logging: true     # Log every stage to run.log
+  
+  # What to persist for the Inference Stage
+  artifacts_to_save:
+    - "model.pkl"
+    - "preprocessor.pkl"
+    - "threshold.txt"       # The single most important output of this project
+    - "threshold_analysis.json" # Full curve data for visualization
