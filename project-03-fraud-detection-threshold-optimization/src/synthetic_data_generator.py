@@ -1,583 +1,306 @@
 import logging
-from typing import Final, TypedDict, assert_never
-from enum import Enum
-from dataclasses import dataclass
-from math import exp, sqrt, pi, erf
-import random
-from collections.abc import Sequence
-
 import numpy as np
 import pandas as pd
-from scipy.stats import poisson, multivariate_normal, lognorm
+import scipy.stats as stats
+from dataclasses import dataclass
+from typing import Literal, Tuple, TypedDict, List, Union
+from enum import Enum
+from collections.abc import Sequence
 
 
-# --- Structured Logging Setup ---
-_logger = logging.getLogger(__name__)
-_LOG_RECORD: Final = {"component": "synthetic_data_generator"}
-
-
-# --- Failure Enumeration ---
-class SyntheticDataGenerationError(Enum):
-    INVALID_FRAUD_RATE = "invalid_fraud_rate"
-    INVALID_EFFECT_SIZE = "invalid_effect_size"
-    INVALID_NUM_FEATURES = "invalid_num_features"
-    INVALID_CATEGORY_CONFIG = "invalid_category_config"
-    INVALID_MISSING_RATE = "invalid_missing_rate"
-    INVALID_PARAMETER_COMBINATION = "invalid_parameter_combination"
-    COVARIANCE_MATRIX_SINGULAR = "covariance_matrix_singular"
-    SEED_FAILURE = "seed_failure"
-    UNEXPECTED_GENERATION_ERROR = "unexpected_generation_error"
-
-
-# --- Immutable Configuration Types ---
-@dataclass(frozen=True)
-class GaussianParameters:
-    """Parameters for class-conditional Gaussian distributions."""
-    mean_legit: np.ndarray
-    mean_fraud: np.ndarray
-    covariance: np.ndarray
+class GenerationError(Enum):
+    INVALID_CONFIG = "invalid_config"
+    INVALID_PARAMETER = "invalid_parameter"
+    NUMERIC_OVERFLOW = "numeric_overflow"
+    SHAPE_MISMATCH = "shape_mismatch"
+    DISTRIBUTION_FAILURE = "distribution_failure"
 
 
 @dataclass(frozen=True)
-class CategoricalFeatureConfig:
-    """Configuration for a categorical feature."""
-    name: str
-    categories: tuple[str, ...]
-    conditional_probabilities: dict[str, dict[int, float]]  # category -> {class: probability}
-
-
-@dataclass(frozen=True)
-class GenerationConfig:
-    """Complete immutable configuration for data generation."""
-    num_samples: int
+class GeneratorConfig:
+    n_samples: int
+    n_signal_features: int
+    n_noise_features: int
     fraud_rate: float
-    effect_size: float
-    num_signal_features: int
-    num_noise_features: int
-    amount_mu_legit: float
-    amount_sigma_legit: float
-    amount_mu_fraud: float
-    amount_sigma_fraud: float
-    poisson_lambda: float
-    categorical_features: tuple[CategoricalFeatureConfig, ...]
+    cohens_d: float
+    fraud_amount_mu_shift: float
+    fraud_amount_sigma_scale: float
+    categorical_cpt: dict[str, dict[Union[int, str], float]]
     missing_rate: float
     random_seed: int
-    dtype_numeric: np.dtype
-    dtype_category: str
 
 
-# --- Canonical Validation Logic ---
-def _validate_fraud_rate(rate: float) -> float:
-    """Validate fraud rate is between 0 and 1."""
-    if not 0 < rate < 1:
-        raise ValueError(f"fraud_rate must be between 0 and 1, got {rate}")
-    return rate
+class GeneratedMetadata(TypedDict):
+    theoretical_max_pr_auc: float
+    class_means: dict[int, np.ndarray]
+    class_covariances: dict[int, np.ndarray]
+    categorical_conditional_probabilities: dict[str, pd.DataFrame]
+    config: GeneratorConfig
 
 
-def _validate_effect_size(size: float) -> float:
-    """Validate effect size is positive."""
-    if size <= 0:
-        raise ValueError(f"effect_size must be positive, got {size}")
-    return size
+class GenerationResult(TypedDict):
+    data: pd.DataFrame
+    metadata: GeneratedMetadata
 
 
-def _validate_feature_counts(num_signal: int, num_noise: int) -> tuple[int, int]:
-    """Validate feature counts are non-negative."""
-    if num_signal < 0 or num_noise < 0:
-        raise ValueError("feature counts must be non-negative")
-    if num_signal + num_noise == 0:
-        raise ValueError("must have at least one feature")
-    return num_signal, num_noise
-
-
-def _validate_amount_params(
-    mu_legit: float,
-    sigma_legit: float,
-    mu_fraud: float,
-    sigma_fraud: float,
-) -> tuple[float, float, float, float]:
-    """Validate log-normal parameters are valid."""
-    if sigma_legit <= 0 or sigma_fraud <= 0:
-        raise ValueError("sigma parameters must be positive")
-    return mu_legit, sigma_legit, mu_fraud, sigma_fraud
-
-
-def _validate_poisson_lambda(lambda_val: float) -> float:
-    """Validate Poisson lambda is positive."""
-    if lambda_val <= 0:
-        raise ValueError(f"poisson_lambda must be positive, got {lambda_val}")
-    return lambda_val
-
-
-def _validate_categorical_features(
-    features: Sequence[CategoricalFeatureConfig],
-) -> tuple[CategoricalFeatureConfig, ...]:
-    """Validate categorical feature configurations."""
-    for feat in features:
-        if not feat.categories:
-            raise ValueError(f"feature {feat.name} has no categories")
-        if not feat.conditional_probabilities:
-            raise ValueError(f"feature {feat.name} has no conditional probabilities")
-        
-        # Validate probability distributions sum to 1 for each class
-        for class_label in (0, 1):
-            total = 0.0
-            for probs in feat.conditional_probabilities.values():
-                if class_label in probs:
-                    total += probs[class_label]
-            if not 0.99 < total < 1.01:  # Allow small floating point tolerance
-                raise ValueError(
-                    f"feature {feat.name} probabilities for class {class_label} sum to {total}, must be 1"
-                )
-    return tuple(features)
-
-
-def _validate_missing_rate(rate: float) -> float:
-    """Validate missing rate is between 0 and 1."""
-    if not 0 <= rate < 1:
-        raise ValueError(f"missing_rate must be between 0 and 1, got {rate}")
-    return rate
-
-
-def _validate_generation_config(config: GenerationConfig) -> GenerationConfig:
-    """Canonical validation of all generation parameters."""
-    _validate_fraud_rate(config.fraud_rate)
-    _validate_effect_size(config.effect_size)
-    _validate_feature_counts(config.num_signal_features, config.num_noise_features)
-    _validate_amount_params(
-        config.amount_mu_legit,
-        config.amount_sigma_legit,
-        config.amount_mu_fraud,
-        config.amount_sigma_fraud,
-    )
-    _validate_poisson_lambda(config.poisson_lambda)
-    _validate_categorical_features(config.categorical_features)
-    _validate_missing_rate(config.missing_rate)
-    return config
-
-
-# --- Pure Core Logic (Statistical Generation) ---
-def _compute_theoretical_pr_auc(
-    effect_size: float,
-    fraud_rate: float,
-) -> float:
-    """
-    Compute theoretical maximum PR-AUC based on Gaussian separation.
-    Uses approximation based on Cohen's d and class imbalance.
-    """
-    # Simplified theoretical maximum based on separation and imbalance
-    # More sophisticated calculation would use integral of precision-recall curve
-    d_prime = effect_size / sqrt(2)  # Convert Cohen's d to discriminability
-    theoretical_auc = 0.5 + 0.5 * erf(d_prime / 2)
-    
-    # Adjust for imbalance - PR-AUC is lower than ROC-AUC with imbalance
-    # This is an approximation for the "Goldilocks" zone (0.70-0.90)
-    imbalance_penalty = 0.15 * (1 - 4 * abs(fraud_rate - 0.5))  # Max penalty at 50/50
-    adjusted_auc = theoretical_auc - imbalance_penalty
-    
-    # Clamp to reasonable range
-    return max(0.5, min(0.95, adjusted_auc))
-
-
-def _build_gaussian_parameters(
-    num_signal: int,
-    effect_size: float,
-    random_gen: np.random.Generator,
-) -> GaussianParameters:
-    """
-    Construct Gaussian parameters with controlled separation.
-    Fraud class mean shifted by effect_size in random direction.
-    """
-    if num_signal == 0:
-        # No signal features, return identical distributions
-        return GaussianParameters(
-            mean_legit=np.zeros(0),
-            mean_fraud=np.zeros(0),
-            covariance=np.zeros((0, 0)),
+class _Logger:
+    def __init__(self) -> None:
+        self.logger = logging.getLogger("synthetic_data_generator")
+        self.logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-    
-    # Generate random orthonormal basis for signal features
-    basis = random_gen.standard_normal((num_signal, num_signal))
-    q, _ = np.linalg.qr(basis)  # Orthonormal basis
-    
-    # Create covariance matrix (identity for simplicity, but could be structured)
-    covariance = np.eye(num_signal)
-    
-    # Shift fraud mean along first basis vector by effect_size
-    shift_vector = q[:, 0] * effect_size
-    mean_fraud = shift_vector
-    
-    return GaussianParameters(
-        mean_legit=np.zeros(num_signal),
-        mean_fraud=mean_fraud,
-        covariance=covariance,
-    )
+        self.logger.addHandler(handler)
+
+    def log_failure(self, error: GenerationError, message: str) -> None:
+        self.logger.error(f"{error.value}: {message}")
 
 
-def _generate_class_labels(
-    num_samples: int,
-    fraud_rate: float,
-    random_gen: np.random.Generator,
-) -> np.ndarray:
-    """Generate binary class labels with exact fraud rate."""
-    num_fraud = int(num_samples * fraud_rate)
-    num_legit = num_samples - num_fraud
-    
-    labels = np.concatenate([
-        np.zeros(num_legit, dtype=np.int8),
-        np.ones(num_fraud, dtype=np.int8),
-    ])
-    random_gen.shuffle(labels)
+_logger = _Logger()
+
+
+def _validate_config(config: GeneratorConfig) -> None:
+    if config.n_samples <= 0:
+        raise ValueError("n_samples must be positive")
+    if config.n_signal_features < 1:
+        raise ValueError("n_signal_features must be at least 1")
+    if config.n_noise_features < 0:
+        raise ValueError("n_noise_features cannot be negative")
+    if not 0.0 < config.fraud_rate < 1.0:
+        raise ValueError("fraud_rate must be strictly between 0 and 1")
+    if config.cohens_d <= 0.0:
+        raise ValueError("cohens_d must be positive")
+    if not 0.0 <= config.missing_rate < 1.0:
+        raise ValueError("missing_rate must be in [0, 1)")
+    if config.fraud_amount_mu_shift <= 0.0:
+        raise ValueError("fraud_amount_mu_shift must be positive")
+    if config.fraud_amount_sigma_scale <= 0.0:
+        raise ValueError("fraud_amount_sigma_scale must be positive")
+    for cat_name, cpt in config.categorical_cpt.items():
+        total_fraud = 0.0
+        total_legit = 0.0
+        for prob in cpt.values():
+            if not 0.0 <= prob <= 1.0:
+                raise ValueError(f"CPT probabilities must be in [0,1] for {cat_name}")
+            total_fraud += prob
+            total_legit += 1.0 - prob
+        if abs(total_fraud - 1.0) > 1e-6 or abs(total_legit - 1.0) > 1e-6:
+            raise ValueError(f"CPT probabilities must sum to 1 for each class in {cat_name}")
+
+
+def _compute_theoretical_pr_auc(
+    mu_0: np.ndarray, mu_1: np.ndarray, sigma_0: np.ndarray, sigma_1: np.ndarray, fraud_rate: float
+) -> float:
+    signal_dim = mu_0.shape[0]
+    pooled_var = (sigma_0 + sigma_1) / 2.0
+    inv_pooled = np.linalg.inv(pooled_var)
+    delta = mu_1 - mu_0
+    mahalanobis = np.sqrt(delta.T @ inv_pooled @ delta)
+    overlap = 2.0 * stats.norm.cdf(-mahalanobis / 2.0)
+    pr_auc = 1.0 - overlap * (1.0 - fraud_rate) / (fraud_rate + (1.0 - fraud_rate) * (1.0 - overlap))
+    return float(np.clip(pr_auc, 0.0, 1.0))
+
+
+def _generate_class_labels(rng: np.random.Generator, n_samples: int, fraud_rate: float) -> np.ndarray:
+    n_fraud = int(n_samples * fraud_rate)
+    n_legit = n_samples - n_fraud
+    labels = np.concatenate([np.zeros(n_legit, dtype=np.int8), np.ones(n_fraud, dtype=np.int8)])
+    rng.shuffle(labels)
     return labels
 
 
 def _generate_signal_features(
+    rng: np.random.Generator,
     labels: np.ndarray,
-    gaussian_params: GaussianParameters,
-    random_gen: np.random.Generator,
-) -> np.ndarray:
-    """Generate signal features from class-conditional Gaussians."""
-    if gaussian_params.mean_legit.size == 0:
-        return np.empty((len(labels), 0))
-    
-    features = np.zeros((len(labels), gaussian_params.mean_legit.size))
-    
-    legit_mask = labels == 0
-    fraud_mask = labels == 1
-    
-    if np.any(legit_mask):
-        legit_samples = multivariate_normal.rvs(
-            mean=gaussian_params.mean_legit,
-            cov=gaussian_params.covariance,
-            size=np.sum(legit_mask),
-            random_state=random_gen,
-        )
-        features[legit_mask] = legit_samples
-    
-    if np.any(fraud_mask):
-        fraud_samples = multivariate_normal.rvs(
-            mean=gaussian_params.mean_fraud,
-            cov=gaussian_params.covariance,
-            size=np.sum(fraud_mask),
-            random_state=random_gen,
-        )
-        features[fraud_mask] = fraud_samples
-    
-    return features
+    n_signal: int,
+    cohens_d: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_samples = labels.shape[0]
+    mu_0 = np.zeros(n_signal)
+    mu_1 = np.full(n_signal, cohens_d)
+    sigma = np.eye(n_signal)
+
+    features = np.zeros((n_samples, n_signal), dtype=np.float32)
+    fraud_idx = labels == 1
+    legit_idx = labels == 0
+
+    n_fraud = np.sum(fraud_idx)
+    n_legit = np.sum(legit_idx)
+
+    if n_fraud > 0:
+        features[fraud_idx] = rng.multivariate_normal(mu_1, sigma, size=n_fraud).astype(np.float32)
+    if n_legit > 0:
+        features[legit_idx] = rng.multivariate_normal(mu_0, sigma, size=n_legit).astype(np.float32)
+
+    return features, mu_0, mu_1
 
 
 def _generate_noise_features(
-    num_samples: int,
-    num_noise: int,
-    random_gen: np.random.Generator,
+    rng: np.random.Generator, n_samples: int, n_noise: int
 ) -> np.ndarray:
-    """Generate pure noise features (independent of labels)."""
-    if num_noise == 0:
-        return np.empty((num_samples, 0))
-    return random_gen.standard_normal((num_samples, num_noise))
+    if n_noise == 0:
+        return np.empty((n_samples, 0), dtype=np.float32)
+    return rng.normal(0, 1, size=(n_samples, n_noise)).astype(np.float32)
 
 
 def _generate_amounts(
+    rng: np.random.Generator,
     labels: np.ndarray,
-    mu_legit: float,
-    sigma_legit: float,
-    mu_fraud: float,
-    sigma_fraud: float,
-    random_gen: np.random.Generator,
+    mu_shift: float,
+    sigma_scale: float,
 ) -> np.ndarray:
-    """Generate transaction amounts from log-normal distributions."""
-    amounts = np.zeros(len(labels))
-    
-    legit_mask = labels == 0
-    fraud_mask = labels == 1
-    
-    if np.any(legit_mask):
-        legit_amounts = lognorm.rvs(
-            s=sigma_legit,
-            scale=exp(mu_legit),
-            size=np.sum(legit_mask),
-            random_state=random_gen,
-        )
-        amounts[legit_mask] = legit_amounts
-    
-    if np.any(fraud_mask):
-        fraud_amounts = lognorm.rvs(
-            s=sigma_fraud,
-            scale=exp(mu_fraud),
-            size=np.sum(fraud_mask),
-            random_state=random_gen,
-        )
-        amounts[fraud_mask] = fraud_amounts
-    
+    n_samples = labels.shape[0]
+    amounts = np.zeros(n_samples, dtype=np.float32)
+    fraud_idx = labels == 1
+    legit_idx = labels == 0
+
+    legit_mu, legit_sigma = 3.0, 0.5
+    fraud_mu = legit_mu + mu_shift
+    fraud_sigma = legit_sigma * sigma_scale
+
+    n_fraud = np.sum(fraud_idx)
+    n_legit = np.sum(legit_idx)
+
+    if n_legit > 0:
+        legit_log = rng.normal(legit_mu, legit_sigma, size=n_legit)
+        amounts[legit_idx] = np.exp(legit_log).astype(np.float32)
+    if n_fraud > 0:
+        fraud_log = rng.normal(fraud_mu, fraud_sigma, size=n_fraud)
+        amounts[fraud_idx] = np.exp(fraud_log).astype(np.float32)
+
+    if not np.all(np.isfinite(amounts)):
+        raise OverflowError("Amount generation produced non-finite values")
+
     return amounts
 
 
 def _generate_timestamps(
-    num_samples: int,
-    poisson_lambda: float,
-    random_gen: np.random.Generator,
-) -> pd.DatetimeIndex:
-    """Generate timestamps using Poisson process."""
-    # Generate inter-arrival times
-    interarrival_times = poisson.rvs(
-        mu=poisson_lambda,
-        size=num_samples - 1,
-        random_state=random_gen,
-    )
-    
-    # Convert to cumulative seconds
-    cumulative_seconds = np.concatenate([[0], np.cumsum(interarrival_times)])
-    
-    # Convert to datetime (starting from a fixed reference point)
-    base_time = pd.Timestamp("2024-01-01")
-    timestamps = base_time + pd.to_timedelta(cumulative_seconds, unit="s")
-    
+    rng: np.random.Generator, n_samples: int, base_date: str = "2024-01-01"
+) -> pd.Series:
+    interarrival_times = rng.exponential(scale=60.0, size=n_samples)
+    cum_seconds = np.cumsum(interarrival_times).astype(np.int64)
+    base_ts = pd.Timestamp(base_date)
+    timestamps = pd.Series([base_ts + pd.Timedelta(seconds=int(s)) for s in cum_seconds])
     return timestamps
 
 
-def _generate_categorical_features(
+def _generate_categoricals(
+    rng: np.random.Generator,
     labels: np.ndarray,
-    configs: tuple[CategoricalFeatureConfig, ...],
-    random_gen: np.random.Generator,
-) -> dict[str, pd.Series]:
-    """Generate categorical features using conditional probability tables."""
-    features = {}
-    
-    for config in configs:
-        categories = config.categories
-        probs = config.conditional_probabilities
-        
-        # For each sample, choose category based on class
-        feature_values = []
-        for label in labels:
-            # Sample from categorical distribution for this class
-            class_probs = np.array([probs[cat][label] for cat in categories])
-            class_probs /= class_probs.sum()  # Normalize to ensure exact sum
-            chosen = random_gen.choice(categories, p=class_probs)
-            feature_values.append(chosen)
-        
-        features[config.name] = pd.Series(
-            feature_values,
-            dtype=config.dtype_category,
-        )
-    
-    return features
+    cpt: dict[str, dict[Union[int, str], float]],
+) -> pd.DataFrame:
+    n_samples = labels.shape[0]
+    categorical_dfs = {}
+
+    for cat_name, probs in cpt.items():
+        categories = list(probs.keys())
+        legit_probs = np.array([1.0 - probs[cat] for cat in categories])
+        legit_probs = legit_probs / legit_probs.sum()
+        fraud_probs = np.array([probs[cat] for cat in categories])
+        fraud_probs = fraud_probs / fraud_probs.sum()
+
+        cat_values = np.empty(n_samples, dtype=object)
+        fraud_idx = labels == 1
+        legit_idx = labels == 0
+
+        if np.sum(legit_idx) > 0:
+            cat_values[legit_idx] = rng.choice(categories, size=np.sum(legit_idx), p=legit_probs)
+        if np.sum(fraud_idx) > 0:
+            cat_values[fraud_idx] = rng.choice(categories, size=np.sum(fraud_idx), p=fraud_probs)
+
+        categorical_dfs[cat_name] = pd.Series(cat_values, dtype="category")
+
+    return pd.DataFrame(categorical_dfs)
 
 
 def _inject_missingness(
-    df: pd.DataFrame,
-    missing_rate: float,
-    random_gen: np.random.Generator,
+    rng: np.random.Generator, df: pd.DataFrame, missing_rate: float
 ) -> pd.DataFrame:
-    """Inject MCAR missingness into numerical features."""
-    if missing_rate == 0:
+    if missing_rate == 0.0:
         return df
-    
+
     df_missing = df.copy()
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    
-    for col in numeric_cols:
-        mask = random_gen.random(len(df)) < missing_rate
-        df_missing.loc[mask, col] = np.nan
-    
+    mask = rng.random(size=df.shape) < missing_rate
+    df_missing[mask] = np.nan
     return df_missing
 
 
-# --- Public API ---
-def generate_synthetic_data(
-    config: GenerationConfig,
-) -> tuple[pd.DataFrame, dict[str, float]] | SyntheticDataGenerationError:
-    """
-    Generate synthetic fraud detection dataset with controlled statistical properties.
-
-    Args:
-        config: GenerationConfig object containing all generation parameters.
-
-    Returns:
-        tuple[pd.DataFrame, dict[str, float]]:
-            - DataFrame with generated features and target
-            - Metadata dict containing theoretical max PR-AUC and other statistics
-        SyntheticDataGenerationError: Enumerated failure reason on error.
-
-    Examples:
-        >>> config = GenerationConfig(
-        ...     num_samples=10000,
-        ...     fraud_rate=0.01,
-        ...     effect_size=0.8,
-        ...     num_signal_features=5,
-        ...     num_noise_features=10,
-        ...     amount_mu_legit=2.0,
-        ...     amount_sigma_legit=0.5,
-        ...     amount_mu_fraud=3.5,
-        ...     amount_sigma_fraud=0.8,
-        ...     poisson_lambda=0.1,
-        ...     categorical_features=(),
-        ...     missing_rate=0.005,
-        ...     random_seed=42,
-        ...     dtype_numeric=np.float32,
-        ...     dtype_category="category",
-        ... )
-        >>> result = generate_synthetic_data(config)
-        >>> if isinstance(result, SyntheticDataGenerationError):
-        ...     print(f"Generation failed: {result.value}")
-        ... else:
-        ...     df, metadata = result
-        ...     print(f"Theoretical PR-AUC: {metadata['theoretical_max_pr_auc']:.3f}")
-    """
-    log_data = {**_LOG_RECORD}
-    _logger.debug("Starting synthetic data generation", extra=log_data)
-
-    # --- Input Validation Boundary ---
+def generate_synthetic_data(config: GeneratorConfig) -> GenerationResult:
     try:
-        validated_config = _validate_generation_config(config)
-    except ValueError as e:
-        log_data["error"] = str(e)
-        error_msg = str(e)
-        if "fraud_rate" in error_msg:
-            _logger.error("Invalid fraud rate", extra=log_data)
-            return SyntheticDataGenerationError.INVALID_FRAUD_RATE
-        elif "effect_size" in error_msg:
-            _logger.error("Invalid effect size", extra=log_data)
-            return SyntheticDataGenerationError.INVALID_EFFECT_SIZE
-        elif "feature" in error_msg:
-            _logger.error("Invalid feature count", extra=log_data)
-            return SyntheticDataGenerationError.INVALID_NUM_FEATURES
-        elif "category" in error_msg.lower():
-            _logger.error("Invalid category configuration", extra=log_data)
-            return SyntheticDataGenerationError.INVALID_CATEGORY_CONFIG
-        elif "missing_rate" in error_msg:
-            _logger.error("Invalid missing rate", extra=log_data)
-            return SyntheticDataGenerationError.INVALID_MISSING_RATE
-        else:
-            _logger.error("Invalid parameter combination", extra=log_data)
-            return SyntheticDataGenerationError.INVALID_PARAMETER_COMBINATION
+        _validate_config(config)
 
-    # --- Seed Setup for Reproducibility ---
-    try:
-        random.seed(validated_config.random_seed)
-        np.random.seed(validated_config.random_seed)
-        rng = np.random.default_rng(validated_config.random_seed)
-    except Exception as e:
-        log_data["error"] = str(e)
-        _logger.critical("Failed to set random seed", extra=log_data)
-        return SyntheticDataGenerationError.SEED_FAILURE
+        rng = np.random.default_rng(config.random_seed)
 
-    # --- Generation Pipeline ---
-    try:
-        # 1. Compute theoretical maximum PR-AUC
-        theoretical_pr_auc = _compute_theoretical_pr_auc(
-            validated_config.effect_size,
-            validated_config.fraud_rate,
+        labels = _generate_class_labels(rng, config.n_samples, config.fraud_rate)
+
+        signal_features, mu_0, mu_1 = _generate_signal_features(
+            rng, labels, config.n_signal_features, config.cohens_d
         )
+        noise_features = _generate_noise_features(rng, config.n_samples, config.n_noise_features)
 
-        # 2. Build Gaussian parameters for signal features
-        try:
-            gaussian_params = _build_gaussian_parameters(
-                validated_config.num_signal_features,
-                validated_config.effect_size,
-                rng,
-            )
-        except np.linalg.LinAlgError as e:
-            log_data["error"] = str(e)
-            _logger.error("Failed to build Gaussian parameters", extra=log_data)
-            return SyntheticDataGenerationError.COVARIANCE_MATRIX_SINGULAR
+        signal_cols = [f"signal_{i}" for i in range(config.n_signal_features)]
+        noise_cols = [f"noise_{i}" for i in range(config.n_noise_features)]
 
-        # 3. Generate class labels
-        labels = _generate_class_labels(
-            validated_config.num_samples,
-            validated_config.fraud_rate,
-            rng,
-        )
+        signal_df = pd.DataFrame(signal_features, columns=signal_cols, dtype=np.float32)
+        noise_df = pd.DataFrame(noise_features, columns=noise_cols, dtype=np.float32)
 
-        # 4. Generate features
-        signal_features = _generate_signal_features(labels, gaussian_params, rng)
-        noise_features = _generate_noise_features(
-            validated_config.num_samples,
-            validated_config.num_noise_features,
-            rng,
-        )
-
-        # 5. Generate amounts
         amounts = _generate_amounts(
-            labels,
-            validated_config.amount_mu_legit,
-            validated_config.amount_sigma_legit,
-            validated_config.amount_mu_fraud,
-            validated_config.amount_sigma_fraud,
-            rng,
+            rng, labels, config.fraud_amount_mu_shift, config.fraud_amount_sigma_scale
         )
+        timestamps = _generate_timestamps(rng, config.n_samples)
 
-        # 6. Generate timestamps
-        timestamps = _generate_timestamps(
-            validated_config.num_samples,
-            validated_config.poisson_lambda,
-            rng,
-        )
+        categoricals = _generate_categoricals(rng, labels, config.categorical_cpt)
 
-        # 7. Generate categorical features
-        categorical_features = _generate_categorical_features(
-            labels,
-            validated_config.categorical_features,
-            rng,
-        )
-
-        # 8. Assemble DataFrame
-        feature_names = (
-            [f"signal_{i}" for i in range(signal_features.shape[1])] +
-            [f"noise_{i}" for i in range(noise_features.shape[1])]
-        )
-        
-        all_features = np.hstack([
-            signal_features,
-            noise_features,
-            amounts.reshape(-1, 1),
-        ])
-        
-        df = pd.DataFrame(
-            all_features,
-            columns=feature_names + ["amount"],
-        )
-        
-        # Convert to specified dtype
-        for col in df.select_dtypes(include=[np.number]).columns:
-            df[col] = df[col].astype(validated_config.dtype_numeric)
-        
-        # Add timestamps
+        df = pd.concat([signal_df, noise_df, categoricals], axis=1)
+        df["transaction_amount"] = amounts
         df["timestamp"] = timestamps
-        
-        # Add categorical features
-        for name, series in categorical_features.items():
-            df[name] = series
-        
-        # Add target
-        df["is_fraud"] = labels
+        df["is_fraud"] = pd.Series(labels, dtype=np.int8)
 
-        # 9. Inject missingness
-        df = _inject_missingness(df, validated_config.missing_rate, rng)
+        sigma_0 = np.eye(config.n_signal_features)
+        sigma_1 = np.eye(config.n_signal_features)
 
-        # 10. Build metadata
-        metadata = {
+        theoretical_pr_auc = _compute_theoretical_pr_auc(
+            mu_0, mu_1, sigma_0, sigma_1, config.fraud_rate
+        )
+
+        df = _inject_missingness(rng, df, config.missing_rate)
+
+        categorical_cpt_dfs = {}
+        for cat_name, probs in config.categorical_cpt.items():
+            categories = list(probs.keys())
+            legit_probs = np.array([1.0 - probs[cat] for cat in categories])
+            legit_probs = legit_probs / legit_probs.sum()
+            fraud_probs = np.array([probs[cat] for cat in categories])
+            fraud_probs = fraud_probs / fraud_probs.sum()
+            cpt_df = pd.DataFrame({"legitimate": legit_probs, "fraud": fraud_probs}, index=categories)
+            categorical_cpt_dfs[cat_name] = cpt_df
+
+        metadata: GeneratedMetadata = {
             "theoretical_max_pr_auc": theoretical_pr_auc,
-            "actual_fraud_rate": float(labels.mean()),
-            "num_samples": validated_config.num_samples,
-            "num_features": len(feature_names) + len(categorical_features) + 2,  # + amount, timestamp
-            "effect_size": validated_config.effect_size,
-            "missing_rate_injected": validated_config.missing_rate,
-            "random_seed_used": validated_config.random_seed,
+            "class_means": {0: mu_0, 1: mu_1},
+            "class_covariances": {0: sigma_0, 1: sigma_1},
+            "categorical_conditional_probabilities": categorical_cpt_dfs,
+            "config": config,
         }
 
-        _logger.info(
-            "Synthetic data generated successfully",
-            extra={**log_data, **metadata},
-        )
-        
-        return df, metadata
+        return {"data": df, "metadata": metadata}
 
+    except ValueError as e:
+        _logger.log_failure(GenerationError.INVALID_CONFIG, str(e))
+        raise
+    except OverflowError as e:
+        _logger.log_failure(GenerationError.NUMERIC_OVERFLOW, str(e))
+        raise
     except Exception as e:
-        log_data["error"] = str(e)
-        _logger.critical(
-            "Unexpected error during generation",
-            extra=log_data,
-            exc_info=True,
-        )
-        return SyntheticDataGenerationError.UNEXPECTED_GENERATION_ERROR
+        _logger.log_failure(GenerationError.DISTRIBUTION_FAILURE, str(e))
+        raise
+
+
+__all__ = [
+    "GeneratorConfig",
+    "GenerationError",
+    "GeneratedMetadata",
+    "GenerationResult",
+    "generate_synthetic_data",
+]
