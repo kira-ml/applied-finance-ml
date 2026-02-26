@@ -139,7 +139,8 @@ def _compute_final_metrics(
     y_test: pd.Series,
     best_proba: np.ndarray,
     t_f2: float,
-    cost_config: CostConfig
+    cost_config: CostConfig,
+    config: ThresholdConfig
 ) -> Tuple[int, int, int, int, float, float, float, float]:
     preds = (best_proba >= t_f2).astype(int)
     
@@ -158,6 +159,7 @@ def _generate_pr_curve(
     precisions: np.ndarray,
     t_f2: float,
     t_cost: float,
+    thresholds: np.ndarray,
     config: ThresholdConfig
 ) -> None:
     try:
@@ -165,14 +167,12 @@ def _generate_pr_curve(
         
         plt.plot(recalls, precisions, 'b-', linewidth=2, label='PR Curve')
         
-        t_f2_idx = np.argmin(np.abs(thresholds - t_f2)) if 'thresholds' in globals() else None
-        t_cost_idx = np.argmin(np.abs(thresholds - t_cost)) if 'thresholds' in globals() else None
+        t_f2_idx = np.argmin(np.abs(thresholds - t_f2))
+        t_cost_idx = np.argmin(np.abs(thresholds - t_cost))
         
-        if t_f2_idx is not None:
-            plt.axvline(x=recalls[t_f2_idx], color='g', linestyle='--', linewidth=2, label=f'F2-optimal (t={t_f2:.3f})')
+        plt.axvline(x=recalls[t_f2_idx], color='g', linestyle='--', linewidth=2, label=f'F2-optimal (t={t_f2:.3f})')
         
-        if t_cost_idx is not None:
-            plt.axvline(x=recalls[t_cost_idx], color='r', linestyle='--', linewidth=2, label=f'Cost-optimal (t={t_cost:.3f})')
+        plt.axvline(x=recalls[t_cost_idx], color='r', linestyle='--', linewidth=2, label=f'Cost-optimal (t={t_cost:.3f})')
         
         plt.xlabel('Recall', fontsize=12)
         plt.ylabel('Precision', fontsize=12)
@@ -288,10 +288,10 @@ def optimize_threshold(
     print(f"Thresholds within {config.agreement_tolerance}: {agreement}")
     
     tn, fp, fn, tp, precision, recall, f2, expected_cost_per_10k = _compute_final_metrics(
-        y_test, best_proba, t_f2, cost_config
+        y_test, best_proba, t_f2, cost_config, config
     )
     
-    _generate_pr_curve(recalls, precisions, t_f2, t_cost, config)
+    _generate_pr_curve(recalls, precisions, t_f2, t_cost, thresholds, config)
     
     _write_evaluation_report(
         config, cost_config, t_f2, t_cost, f2_at_t_f2, cost_at_t_cost, agreement,
