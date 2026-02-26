@@ -123,18 +123,7 @@ def _fill_categorical_nulls(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _apply_log_transform(df: pd.DataFrame, config: InferenceConfig) -> pd.DataFrame:
-    amount_col = None
-    for col_name in config.amount_column_names:
-        if col_name in df.columns:
-            amount_col = col_name
-            break
-    
-    if amount_col is None:
-        return df
-    
-    df = df.copy()
-    df['log_amount'] = np.log1p(df[amount_col])
-    df = df.drop(columns=[amount_col])
+    # SKIP LOG TRANSFORM - model expects original TransactionAmt
     return df
 
 def _extract_temporal_features(df: pd.DataFrame, config: InferenceConfig) -> pd.DataFrame:
@@ -275,7 +264,7 @@ def run_inference(csv_path: str) -> None:
     working_df = _fill_numeric_nulls(working_df)
     working_df = _fill_categorical_nulls(working_df)
     
-    working_df = _apply_log_transform(working_df, config)
+    working_df = _apply_log_transform(working_df, config)  # Now does nothing
     working_df = _extract_temporal_features(working_df, config)
     working_df = _drop_id_columns(working_df, config)
     
