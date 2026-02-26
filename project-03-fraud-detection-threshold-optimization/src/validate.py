@@ -33,10 +33,10 @@ class ReportWriteError(ValidationError):
     pass
 
 def _validate_input(df: pd.DataFrame) -> None:
-    if df.empty:
-        raise DataFrameEmptyError("Input DataFrame is empty")
     if not isinstance(df, pd.DataFrame):
         raise ValidationError(f"Expected pandas DataFrame, got {type(df)}")
+    if df.empty:
+        raise DataFrameEmptyError("Input DataFrame is empty")
 
 def _drop_high_null_columns(df: pd.DataFrame, config: ValidationConfig) -> Tuple[pd.DataFrame, List[str]]:
     null_rates = df.isnull().mean()
@@ -101,13 +101,13 @@ def _check_log_transform_flag(df: pd.DataFrame, config: ValidationConfig) -> boo
         return False
     
     max_val = df[amount_col].max()
-    mean_val = df[amount_col].mean()
-    
-    if mean_val == 0:
+    median_val = df[amount_col].median()
+
+    if median_val == 0:
         return False
-    
-    ratio = max_val / mean_val
-    return ratio > config.max_mean_ratio_threshold
+
+    ratio = max_val / median_val
+    return bool(ratio > config.max_mean_ratio_threshold)
 
 def _find_zero_variance_columns(df: pd.DataFrame) -> List[str]:
     numeric_cols = df.select_dtypes(include=[np.number]).columns
