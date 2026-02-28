@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Artifacts (generated at runtime)
+artifacts/
+
+# Data (never commit raw or output data)
+data/
+
+# Jupyter (if accidentally opened)
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
