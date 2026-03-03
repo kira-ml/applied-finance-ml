@@ -12,6 +12,7 @@ This module intentionally avoids:
 - Any transformation beyond loading and validation
 """
 
+import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Union, Optional

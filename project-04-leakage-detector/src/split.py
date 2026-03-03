@@ -20,6 +20,7 @@ def time_series_split(
     n_samples: int,
     n_splits: int = 5,
     train_size: Optional[int] = None,
+    initial_train_size: Optional[int] = None,
     valid_size: int = 1,
     gap: int = 0,
     expanding: bool = True
@@ -34,17 +35,19 @@ def time_series_split(
     n_splits : int
         Number of train/validation splits to generate.
     train_size : int, optional
-        Number of samples to use for training.
-        - If None and expanding=True: train_size grows with each split
-        - If None and expanding=False: train_size = n_samples - (n_splits * valid_size)
-        - If specified: fixed training size (must be <= n_samples - valid_size)
+        Fixed training window size for sliding window mode (expanding=False).
+        Ignored when expanding=True.
+    initial_train_size : int, optional
+        Starting training size for fold 1 in expanding window mode.
+        If None, defaults to n_samples - n_splits * (valid_size + gap),
+        which utilises all available data across all folds.
     valid_size : int
-        Number of samples to use for validation.
+        Number of samples to use for validation per fold.
     gap : int
         Number of samples to skip between train and validation sets.
         Prevents leakage from adjacent time points.
     expanding : bool
-        If True, training set expands with each split.
+        If True, training set expands with each split (expanding window).
         If False, training set is a sliding window of fixed size.
 
     Yields
@@ -95,16 +98,23 @@ def time_series_split(
     # Handle None train_size based on mode
     if train_size is None:
         if expanding:
-            # Expanding window: start with minimum, grow each split
-            min_train = valid_size + gap
-            if min_train > n_samples - valid_size:
+            # Expanding window: default initial size uses ALL available data
+            # so that fold 1 is already well-trained and folds converge quickly.
+            default_min_train = n_samples - n_splits * (valid_size + gap)
+            if default_min_train <= 0:
                 raise ValueError(
-                    f"Cannot create expanding splits with {n_splits} folds. "
-                    f"Need at least {min_train + (n_splits-1) * valid_size} samples, "
+                    f"Cannot create {n_splits} expanding splits with "
+                    f"valid_size={valid_size} and gap={gap}. "
+                    f"Need at least {n_splits * (valid_size + gap) + 1} samples, "
                     f"have {n_samples}"
                 )
+            start_train = initial_train_size if initial_train_size is not None else default_min_train
+            if start_train <= 0:
+                raise ValueError(
+                    f"initial_train_size must be positive, got {start_train}"
+                )
             train_sizes = [
-                min_train + i * valid_size 
+                start_train + i * (valid_size + gap)
                 for i in range(n_splits)
             ]
         else:
@@ -118,7 +128,7 @@ def time_series_split(
             train_size = max_possible_train
             train_sizes = [train_size] * n_splits
     else:
-        # Fixed train_size
+        # Fixed train_size (sliding mode only — expanding handled above)
         train_sizes = [train_size] * n_splits
     
     # Generate splits
