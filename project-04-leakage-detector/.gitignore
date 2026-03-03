@@ -21,13 +21,12 @@ ENV/
 .ipynb_checkpoints/
 *.ipynb
 
-# Data (keep structure, ignore content)
-data/raw/*.csv
+# Data — synthetic files are tracked for reproducibility
+# Exclude only processed/intermediate outputs
 data/processed/
 
-# Artifacts & model outputs
-artifacts/*
-!artifacts/.gitkeep
+# Artifacts & model outputs (timestamped — do not track)
+artifacts/
 
 # Environment & secrets
 .env

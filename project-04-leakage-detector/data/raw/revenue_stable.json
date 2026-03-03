@@ -1,0 +1,11 @@
+{
+  "type": "stable",
+  "n_days": 730,
+  "seed": 42,
+  "trend_slope": 0.05,
+  "seasonality_amplitude": 50.0,
+  "noise_std": 30.0,
+  "structural_break": null,
+  "stable_mode": true,
+  "expected_variance": "<5%"
+}
